@@ -1,0 +1,11 @@
+{
+  "name": "comwit-state-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.3.0",
+  "scripts": {
+    "dev": "pnpm --filter @comwit/state dev",
+    "build": "pnpm --filter @comwit/state build",
+    "test": "pnpm --filter @comwit/state test",
+    "typecheck": "pnpm -r --if-present typecheck"
+  }
+}

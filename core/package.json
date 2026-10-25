@@ -5,11 +5,11 @@
   "homepage": "https://library.comwit.io/state",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/burrr-ai/comwit.git",
-    "directory": "packages/state/core"
+    "url": "git+https://github.com/comwit/state.git",
+    "directory": "core"
   },
   "bugs": {
-    "url": "https://github.com/burrr-ai/comwit/issues"
+    "url": "https://github.com/comwit/state/issues"
   },
   "publishConfig": {
     "access": "public",

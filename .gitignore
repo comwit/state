@@ -1,0 +1,10 @@
+node_modules
+dist
+.next
+*.tsbuildinfo
+.pnpm-store
+storybook-static
+.DS_Store
+core/src/icons/generated/
+cli/registry/
+apps/storybook/src/generated/
