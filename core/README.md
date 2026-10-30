@@ -97,9 +97,9 @@ split models, actions, and hooks into [domain folders](https://library.comwit.io
 
 | What you need                                              | API / guide                                                                                          |
 | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Fetch and cache server data                                | [`query()` + `.load(arg)`](https://library.comwit.io/state/docs/api/query)                           |
-| Initialize queries from Server Component data              | [`useDomain.hydrate(...)`](https://library.comwit.io/state/docs/guide/nextjs)                        |
-| Stream a Suspense boundary with its query (experimental)   | [`.suspend(arg)`](https://library.comwit.io/state/docs/guide/nextjs#streaming-suspense-experimental) |
+| Render server data with SSR and Suspense                   | [`.suspend(arg)`](https://library.comwit.io/state/docs/guide/nextjs)                                 |
+| Fetch and cache data in the browser                        | [`query()` + `.load(arg)`](https://library.comwit.io/state/docs/api/query)                           |
+| Seed data a Server Component already fetched (alternative) | [`useDomain.hydrate(...)`](https://library.comwit.io/state/docs/guide/nextjs)                        |
 | Restore an exact IndexedDB view without an API request     | [`local()` + `.restore(arg)`](https://library.comwit.io/state/docs/api/local)                        |
 | Keep IndexedDB views and revalidate from the server        | [`local.query()` / `local.infinite()`](https://library.comwit.io/state/docs/api/local)               |
 | Persist browser-owned preferences                          | [`persist()`](https://library.comwit.io/state/docs/api/persist)                                      |
@@ -109,37 +109,50 @@ split models, actions, and hooks into [domain folders](https://library.comwit.io
 
 ### Queries and Next.js
 
-Use `.load(arg)` in a selector for ordinary client fetching. It reports loading state during render
-and starts the request after commit. Reading query state without `.load()` does not start a request.
-
-Server-rendered data takes one of two paths. Either works.
+Read server data with `.suspend(arg)` in the Client Component that renders it, inside `<Suspense>`:
 
 ```tsx
 'use client'
 
-// hydrate(): a Server Component awaited the value and passed it to this route adapter.
-function ProductRoute({ id, initialProduct }: Props) {
-  useProduct.hydrate({ detail: { arg: id, data: initialProduct } })
-  return <ProductDetail />
-}
-
-// .suspend() (experimental): one component inside <Suspense> fetches, streams and hydrates.
 function ProductDetail({ id }: { id: string }) {
   const product = useProduct((s) => s.detail.suspend(id))
   return product.data ? <h1>{product.data.title}</h1> : null
 }
 ```
 
-`useDomain.hydrate(...)` runs before the normal domain hook reads the data. It is idempotent, never
-calls `queryFn`, and applies changes to already observed entries only after the requesting render
-commits. Use it whenever the fetch must stay on the server, including Next.js Server Functions.
+```tsx
+<Suspense fallback={<ProductSkeleton />}>
+  <ProductDetail id={id} />
+</Suspense>
+```
 
-Selector `.suspend(arg)` is the more atomic form: no server fetch step and no adapter, just the
-component that reads the data. It is experimental and requires a `queryFn` that can run during
-render on both server and client. Pass Next.js `useServerInsertedHTML` to `ComwitProvider` and a
-result resolved during the server render streams to the browser, so hydration renders it without a
-second request. The descriptor-level `suspense` option is deprecated; do not hydrate through a
-mutating action during render. See the [Next.js guide](https://library.comwit.io/state/docs/guide/nextjs).
+Pass Next.js `useServerInsertedHTML` to the provider once. The server render runs `queryFn` and
+streams the result into the browser cache, so hydration renders it without a second request. There
+is no Server Component fetch and no route adapter.
+
+```tsx
+'use client'
+
+import { useServerInsertedHTML } from 'next/navigation'
+
+<ComwitProvider useServerInsertedHTML={useServerInsertedHTML}>{children}</ComwitProvider>
+```
+
+`queryFn` runs on both server and browser, so call an API with an absolute URL and return JSON data.
+
+Use `.load(arg)` when the component renders its own loading state. It reports `isLoading` during
+render and starts the request after commit, never during SSR:
+
+```tsx
+const list = useProduct((s) => s.list.load({ page }))
+if (list.isLoading) return <Skeleton />
+```
+
+Reading query state without `.load()` or `.suspend()` does not start a request.
+
+When `queryFn` cannot run during SSR (database code, Server Functions), await the value in a Server
+Component and seed it with `useProduct.hydrate({ detail: { arg: id, data: initialProduct } })`
+before the domain hook reads it. See the [Next.js guide](https://library.comwit.io/state/docs/guide/nextjs).
 
 ### Slow initial loading
 
