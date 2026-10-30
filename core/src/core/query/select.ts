@@ -1,6 +1,7 @@
 import { serializeResourceArg } from './accessor'
 import type {
   AnyResourceDescriptor,
+  PlaceholderData,
   QueryBindingRegistry,
   QueryCacheKey,
   ResourceDataLike,
@@ -9,6 +10,7 @@ import type {
 } from './types'
 import {
   RESOURCE_SUSPEND_COMMIT,
+  RESOURCE_SUSPEND_PLACEHOLDER,
   RESOURCE_SUSPEND_PREPARE,
   RESOURCE_SUSPEND_RESTORE,
   RESOURCE_SUSPEND_STREAM,
@@ -62,13 +64,45 @@ function pendingState(descriptor: AnyResourceDescriptor, isFetching: boolean) {
   }) as ResourceDataLike
 }
 
+/** Previous data shown while a `.suspend()` key with `placeholderData` loads after commit. */
+function placeholderState(
+  state: ResourceDataLike,
+  controller: ResourceDataLike,
+  key: QueryCacheKey,
+  arg: unknown
+): ResourceDataLike | undefined {
+  const read = Reflect.get(controller, RESOURCE_SUSPEND_PLACEHOLDER)
+  if (typeof read !== 'function') return
+  const placeholder = read.call(controller, key) as
+    | { placeholderData: PlaceholderData<unknown, unknown> }
+    | undefined
+  if (!placeholder) return
+  const { placeholderData } = placeholder
+  return Object.freeze({
+    ...state,
+    data:
+      typeof placeholderData === 'function'
+        ? (placeholderData as (queryArg: unknown, previousData: unknown) => unknown)(
+            arg,
+            state.data
+          )
+        : placeholderData,
+    isLoading: false,
+    isFetching: true,
+    isError: false,
+    error: null,
+  }) as ResourceDataLike
+}
+
 function cachedState(
   state: ResourceDataLike,
   runtime: ResourceRuntimeState | undefined,
   controller: ResourceDataLike,
   descriptor: AnyResourceDescriptor,
   key: QueryCacheKey,
-  registry: QueryBindingRegistry
+  registry: QueryBindingRegistry,
+  arg: unknown,
+  mode: 'load' | 'suspend'
 ): ResourceDataLike {
   const activeEntry = runtime?.activeKey === key ? runtime.cacheEntries.get(key) : undefined
   // A first `.suspend()` result is already the proxy value, but until the selecting tree commits
@@ -91,6 +125,11 @@ function cachedState(
   const entryState = entry?.state
   if (entryState?.isError === true) {
     return entryState
+  }
+
+  if (mode === 'suspend') {
+    const placeholder = placeholderState(state, controller, key, arg)
+    if (placeholder) return placeholder
   }
 
   return pendingState(descriptor, pending)
@@ -141,7 +180,7 @@ function createResourceSelector(
         }
 
         const runtime = registry.boundResourceRuntime.get(controller)
-        return cachedState(state, runtime, controller, descriptor, key, registry)
+        return cachedState(state, runtime, controller, descriptor, key, registry, arg, load.mode)
       }
     },
   })
