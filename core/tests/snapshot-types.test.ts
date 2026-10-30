@@ -182,9 +182,9 @@ function hydrationTypeContract() {
   useSelectorModel.hydrate({ missing: { data: 1 } })
 
   useSelectorModel((state) => state.list.suspend({ page: 1 }))
-  // @ts-expect-error experimental suspend owns its queryFn and accepts no Promise override
+  // @ts-expect-error suspend owns its queryFn and accepts no Promise override
   useSelectorModel((state) => state.list.suspend({ page: 1 }, Promise.resolve(['one'])))
-  // @ts-expect-error experimental suspend accepts no initialData options
+  // @ts-expect-error suspend accepts no initialData options
   useSelectorModel((state) => state.list.suspend({ page: 1 }, { initialData: ['one'] }))
 }
 

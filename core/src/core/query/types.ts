@@ -211,11 +211,11 @@ type ResourceLoadController<TState, TArg> = [TArg] extends [void]
 
 type ResourceSuspendController<TState, TArg> = [TArg] extends [void]
   ? {
-      /** @experimental Render-time query execution is not compatible with every SSR transport. */
+      /** Suspends during render until the query resolves; `queryFn` also runs on the server. */
       suspend(): TState
     }
   : {
-      /** @experimental Render-time query execution is not compatible with every SSR transport. */
+      /** Suspends during render until the query resolves; `queryFn` also runs on the server. */
       suspend(arg: TArg): TState
     }
 
