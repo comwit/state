@@ -2,7 +2,16 @@
 import React, { Component, Suspense, startTransition, type ReactNode } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, test, vi } from 'vitest'
-import { action, ComwitProvider, local, model, query, useAction, useModel } from '../src'
+import {
+  action,
+  ComwitProvider,
+  keepPreviousData,
+  local,
+  model,
+  query,
+  useAction,
+  useModel,
+} from '../src'
 
 /** A render that suspends through React 19 `use()` must run inside an awaited act. */
 async function renderAsync(ui: React.ReactElement) {
@@ -426,5 +435,94 @@ describe('query selector suspend', () => {
       await request.promise
     })
     await waitFor(() => expect(screen.getByTestId('value').textContent).toBe('loaded'))
+  })
+
+  describe('placeholderData on an argument change', () => {
+    function setup(placeholderData?: typeof keepPreviousData) {
+      const requests = new Map<number, ReturnType<typeof deferred<string[]>>>()
+      const request = (page: number) => {
+        if (!requests.has(page)) requests.set(page, deferred<string[]>())
+        return requests.get(page)!
+      }
+      const queryFn = vi.fn(({ page }: { page: number }) => request(page).promise)
+      const catalog = model({
+        page: 1,
+        items: query<string[], { page: number }>({ initialData: [], queryFn, placeholderData }),
+      })
+      const catalogActions = action(({ state }) => ({
+        setPage(page: number) {
+          state(catalog).page = page
+        },
+      }))
+
+      function View() {
+        const items = useModel(catalog, (state) => state.items.suspend({ page: state.page }))
+        const actions = useAction<{ setPage(page: number): void }>([catalogActions])
+        return (
+          <>
+            <div data-testid="items">{items.data.join(',')}</div>
+            <div data-testid="fetching">{String(items.isFetching)}</div>
+            <button onClick={() => actions.setPage(2)}>page 2</button>
+          </>
+        )
+      }
+
+      return { request, queryFn, View }
+    }
+
+    async function renderFirstPage(
+      View: () => React.ReactElement,
+      request: (page: number) => ReturnType<typeof deferred<string[]>>
+    ) {
+      await renderAsync(
+        <ComwitProvider>
+          <Suspense fallback={<div data-testid="fallback">loading</div>}>
+            <View />
+          </Suspense>
+        </ComwitProvider>
+      )
+      await act(async () => {
+        request(1).resolve(['a'])
+        await request(1).promise
+      })
+      await waitFor(() => expect(screen.getByTestId('items').textContent).toBe('a'))
+    }
+
+    test('keepPreviousData keeps the previous result visible instead of suspending', async () => {
+      const { request, queryFn, View } = setup(keepPreviousData)
+      await renderFirstPage(View, request)
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('page 2'))
+      })
+      expect(screen.queryByTestId('fallback')).toBeNull()
+      expect(screen.getByTestId('items').textContent).toBe('a')
+      expect(screen.getByTestId('fetching').textContent).toBe('true')
+      expect(queryFn).toHaveBeenCalledTimes(2)
+
+      await act(async () => {
+        request(2).resolve(['b'])
+        await request(2).promise
+      })
+      await waitFor(() => expect(screen.getByTestId('items').textContent).toBe('b'))
+      expect(screen.getByTestId('fetching').textContent).toBe('false')
+      expect(queryFn).toHaveBeenCalledTimes(2)
+    })
+
+    test('without placeholderData a new argument still suspends', async () => {
+      const { request, View } = setup()
+      await renderFirstPage(View, request)
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('page 2'))
+      })
+      expect(screen.getByTestId('fallback')).toBeDefined()
+
+      await act(async () => {
+        request(2).resolve(['b'])
+        await request(2).promise
+      })
+      await waitFor(() => expect(screen.getByTestId('items').textContent).toBe('b'))
+    })
   })
 })
