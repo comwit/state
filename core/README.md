@@ -99,7 +99,7 @@ split models, actions, and hooks into [domain folders](https://library.comwit.io
 | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | Render server data with SSR and Suspense                   | [`.suspend(arg)`](https://library.comwit.io/state/docs/guide/nextjs)                                 |
 | Fetch and cache data in the browser                        | [`query()` + `.load(arg)`](https://library.comwit.io/state/docs/api/query)                           |
-| Seed data a Server Component already fetched (alternative) | [`useDomain.hydrate(...)`](https://library.comwit.io/state/docs/guide/nextjs)                        |
+| SSR alternative without `useServerInsertedHTML`            | [`useDomain.hydrate(...)`](https://library.comwit.io/state/docs/guide/nextjs)                        |
 | Restore an exact IndexedDB view without an API request     | [`local()` + `.restore(arg)`](https://library.comwit.io/state/docs/api/local)                        |
 | Keep IndexedDB views and revalidate from the server        | [`local.query()` / `local.infinite()`](https://library.comwit.io/state/docs/api/local)               |
 | Persist browser-owned preferences                          | [`persist()`](https://library.comwit.io/state/docs/api/persist)                                      |
@@ -150,9 +150,10 @@ if (list.isLoading) return <Skeleton />
 
 Reading query state without `.load()` or `.suspend()` does not start a request.
 
-When `queryFn` cannot run during SSR (database code, Server Functions), await the value in a Server
-Component and seed it with `useProduct.hydrate({ detail: { arg: id, data: initialProduct } })`
-before the domain hook reads it. See the [Next.js guide](https://library.comwit.io/state/docs/guide/nextjs).
+In a framework whose provider has no `useServerInsertedHTML` (or an equivalent), a server response
+cannot reach the client cache, so client navigation requests it again. There, fetch on the server
+and pass the result to `useProduct.hydrate({ detail: { arg: id, data: initialProduct } })` before
+the domain hook reads it. Next.js does not need this. See the [Next.js guide](https://library.comwit.io/state/docs/guide/nextjs).
 
 ### Slow initial loading
 
