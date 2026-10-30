@@ -43,10 +43,10 @@ export type ComwitProviderProps = {
   /** Read once during server rendering. Return null when request search is unavailable. Never called in the browser. */
   getServerSearchParams?: () => string | null
   /**
-   * Experimental. Streams `.suspend()` results resolved during server rendering into the browser
-   * cache, so the hydrating selector renders the same data without calling `queryFn` again. Pass
-   * Next.js `useServerInsertedHTML`; the provider inserts an inert JSON script ahead of each
-   * flushed Suspense boundary. Read once at mount; it must not change afterwards.
+   * Streams `.suspend()` results resolved during server rendering into the browser cache, so the
+   * hydrating selector renders the same data without calling `queryFn` again. Pass Next.js
+   * `useServerInsertedHTML`; the provider inserts an inert JSON script ahead of each flushed
+   * Suspense boundary. Read once at mount; it must not change afterwards.
    */
   useServerInsertedHTML?: ServerInsertedHTMLHook
 }

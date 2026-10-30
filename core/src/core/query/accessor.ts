@@ -840,7 +840,7 @@ export function createResourceAccessor(
   }
 
   /**
-   * Experimental: prepare an initial query for selector `.suspend()` without touching the
+   * Prepare an initial query for selector `.suspend()` without touching the
    * observable resource proxy. Cache entries live outside the proxy, so a
    * discarded concurrent render cannot leak a new active value into the
    * currently committed screen.
@@ -995,7 +995,7 @@ export function createResourceAccessor(
   }
 
   /**
-   * Experimental: seed a `.suspend()` key from a result the server resolved and streamed into
+   * Seed a `.suspend()` key from a result the server resolved and streamed into
    * this document. It runs while the selector reads its snapshot and never calls `queryFn`.
    * Like `hydrate()`, a model whose snapshot has not been read yet (`mayInitialize`) and whose
    * resource was never queried is initialized right away so the hydrating render matches the
