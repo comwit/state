@@ -7,6 +7,7 @@ export const RESOURCE_SUSPEND_PREPARE = Symbol('comwit-resource-suspend-prepare'
 export const RESOURCE_SUSPEND_COMMIT = Symbol('comwit-resource-suspend-commit')
 export const RESOURCE_SUSPEND_RESTORE = Symbol('comwit-resource-suspend-restore')
 export const RESOURCE_SUSPEND_STREAM = Symbol('comwit-resource-suspend-stream')
+export const RESOURCE_SUSPEND_PLACEHOLDER = Symbol('comwit-resource-suspend-placeholder')
 export const RESOURCE_HYDRATE = Symbol('comwit-resource-hydrate')
 
 export type AsyncResult<T> = T | Promise<T> | AsyncIterable<T>

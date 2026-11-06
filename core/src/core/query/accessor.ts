@@ -7,6 +7,7 @@ import {
   RESOURCE_HYDRATE,
   RESOURCE_QUERY_OPTION_KEYS,
   RESOURCE_SUSPEND_COMMIT,
+  RESOURCE_SUSPEND_PLACEHOLDER,
   RESOURCE_SUSPEND_PREPARE,
   RESOURCE_SUSPEND_RESTORE,
   RESOURCE_SUSPEND_STREAM,
@@ -840,6 +841,34 @@ export function createResourceAccessor(
   }
 
   /**
+   * With `placeholderData`, a `.suspend()` key that has no result yet does not suspend while the
+   * resource already shows another key's result: the selector keeps that data visible and the key
+   * loads after commit like `.load()`. Returns the placeholder option in that case.
+   */
+  const readSuspendPlaceholder = (key: QueryCacheKey) => {
+    if (runtime.activeKey === undefined || runtime.activeKey === key) return
+    if (!getActiveEntry()?.hasQueried || runtime.cacheEntries.get(key)?.hasQueried) return
+    const { placeholderData } = normalizeDescriptorOptions<unknown, unknown>(
+      descriptor,
+      defaults,
+      undefined
+    )
+    return placeholderData === undefined ? undefined : { placeholderData }
+  }
+
+  /** True while a key loads behind the previous result instead of suspending. */
+  const keepsPreviousResult = (key: QueryCacheKey) => {
+    if (readSuspendPlaceholder(key)) return true
+    // After commit the key is active and fetching, with the placeholder still visible.
+    return (
+      runtime.activeKey === key &&
+      !runtime.cacheEntries.get(key)?.hasQueried &&
+      state.isFetching === true &&
+      state.isLoading === false
+    )
+  }
+
+  /**
    * Prepare an initial query for selector `.suspend()` without touching the
    * observable resource proxy. Cache entries live outside the proxy, so a
    * discarded concurrent render cannot leak a new active value into the
@@ -863,6 +892,7 @@ export function createResourceAccessor(
     if (entry.hasQueried) return
     if (entry.suspendError) throw entry.suspendError
     if (entry.suspendPromise) return entry.suspendPromise
+    if (keepsPreviousResult(key)) return
 
     // Reuse an effect/direct query that was already started for this exact
     // controller and key. It began after a previous commit, so it is safe to
@@ -1064,7 +1094,12 @@ export function createResourceAccessor(
   ): Promise<unknown> => {
     const queryArg = hasArg ? arg : undefined
     const entry = runtime.cacheEntries.get(key)
-    if (!entry?.hasQueried) return Promise.resolve()
+    if (!entry?.hasQueried) {
+      // A key kept behind placeholder data loads now, keeping the previous result visible.
+      return readSuspendPlaceholder(key)
+        ? executeQuery(queryArg, undefined, hasArg, 'replace', false)
+        : Promise.resolve()
+    }
 
     if (!entry.suspendNeedsCommit) {
       // A previously committed cache hit remains visible while its normal
@@ -1359,6 +1394,7 @@ export function createResourceAccessor(
       if (prop === RESOURCE_SUSPEND_COMMIT) return commitSuspend
       if (prop === RESOURCE_SUSPEND_RESTORE) return restoreSuspend
       if (prop === RESOURCE_SUSPEND_STREAM) return readSuspendStream
+      if (prop === RESOURCE_SUSPEND_PLACEHOLDER) return readSuspendPlaceholder
       if (prop === 'query') return queryFn
       if (descriptor.selectorMethod && prop === descriptor.selectorMethod) return queryFn
       if (prop === 'refetch') return refetch
