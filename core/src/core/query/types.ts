@@ -10,6 +10,13 @@ export const RESOURCE_SUSPEND_RESTORE = Symbol('comwit-resource-suspend-restore'
 export const RESOURCE_SUSPEND_STREAM = Symbol('comwit-resource-suspend-stream')
 export const RESOURCE_SUSPEND_PLACEHOLDER = Symbol('comwit-resource-suspend-placeholder')
 export const RESOURCE_HYDRATE = Symbol('comwit-resource-hydrate')
+/**
+ * Marks a descriptor whose selectors expose `.load()` but not `.suspend()`. `local()` sets it:
+ * suspending on a durable resource would skip its IndexedDB restore, so the selector throws.
+ */
+export const RESOURCE_LOAD_ONLY = Symbol('comwit-resource-load-only')
+
+export type LoadOnlyResource = { readonly [RESOURCE_LOAD_ONLY]: true }
 
 export type AsyncResult<T> = T | Promise<T> | AsyncIterable<T>
 
@@ -305,6 +312,16 @@ export type SelectableSingleResourceState<TData, TArg = void, TSeed = never> = [
 export type SelectableInfiniteResourceState<TData, TArg = void> = ResourceInfiniteState<TData> &
   ResourceLoadController<ResourceInfiniteState<TData>, TArg> &
   ResourceSuspendController<ResourceInfiniteState<TData>, TArg>
+/** `SelectableSingleResourceState` without `.suspend()`, for `LoadOnlyResource` descriptors. */
+export type LoadableSingleResourceState<TData, TArg = void, TSeed = never> = [TSeed] extends [
+  never,
+]
+  ? ResourceSingleState<TData> & ResourceLoadController<ResourceSingleState<TData>, TArg>
+  : SeededSingleResourceState<TData, TSeed> &
+      ResourceLoadController<SeededSingleResourceState<TData, TSeed>, TArg>
+/** `SelectableInfiniteResourceState` without `.suspend()`, for `LoadOnlyResource` descriptors. */
+export type LoadableInfiniteResourceState<TData, TArg = void> = ResourceInfiniteState<TData> &
+  ResourceLoadController<ResourceInfiniteState<TData>, TArg>
 export type SelectableRealtimeResourceState<TData, TArg = void> = ResourceRealtimeState<TData> &
   ResourceLoadController<ResourceRealtimeState<TData>, TArg>
 
@@ -385,23 +402,29 @@ export type SelectableResourceState<T> = T extends {
   [RESOURCE_TYPE_OVERRIDE]: { selectable: infer TSelectable }
 }
   ? TSelectable
-  : T extends RealtimeResourceDescriptor<infer TData, infer TArg>
-    ? SelectableRealtimeResourceState<TData, TArg>
-    : T extends InfiniteResourceDescriptor<infer TData, infer TArg, infer TSuspense>
-      ? TSuspense extends true
-        ? SuspenseSelectableInfiniteResourceState<TData, TArg>
-        : SelectableInfiniteResourceState<TData, TArg>
-      : T extends SingleResourceDescriptor<infer TData, infer TArg, infer TSuspense, unknown>
+  : T extends LoadOnlyResource
+    ? T extends InfiniteResourceDescriptor<infer TData, infer TArg, boolean>
+      ? LoadableInfiniteResourceState<TData, TArg>
+      : T extends SingleResourceDescriptor<infer TData, infer TArg, boolean, unknown>
+        ? LoadableSingleResourceState<TData, TArg, ResourceSeed<T>>
+        : never
+    : T extends RealtimeResourceDescriptor<infer TData, infer TArg>
+      ? SelectableRealtimeResourceState<TData, TArg>
+      : T extends InfiniteResourceDescriptor<infer TData, infer TArg, infer TSuspense>
         ? TSuspense extends true
-          ? SuspenseSelectableSingleResourceState<TData, TArg>
-          : SelectableSingleResourceState<TData, TArg, ResourceSeed<T>>
-        : T extends (infer U)[]
-          ? SelectableResourceState<U>[]
-          : T extends (...args: any[]) => any
-            ? T
-            : T extends object
-              ? { [K in keyof T]: SelectableResourceState<T[K]> }
-              : T
+          ? SuspenseSelectableInfiniteResourceState<TData, TArg>
+          : SelectableInfiniteResourceState<TData, TArg>
+        : T extends SingleResourceDescriptor<infer TData, infer TArg, infer TSuspense, unknown>
+          ? TSuspense extends true
+            ? SuspenseSelectableSingleResourceState<TData, TArg>
+            : SelectableSingleResourceState<TData, TArg, ResourceSeed<T>>
+          : T extends (infer U)[]
+            ? SelectableResourceState<U>[]
+            : T extends (...args: any[]) => any
+              ? T
+              : T extends object
+                ? { [K in keyof T]: SelectableResourceState<T[K]> }
+                : T
 
 type QueryHydrationSeed<TData, TArg> = [TArg] extends [void]
   ? { data: TData; arg?: never }

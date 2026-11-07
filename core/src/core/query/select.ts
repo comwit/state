@@ -9,11 +9,13 @@ import type {
   ResourceRuntimeState,
 } from './types'
 import {
+  RESOURCE_LOAD_ONLY,
   RESOURCE_SUSPEND_COMMIT,
   RESOURCE_SUSPEND_PLACEHOLDER,
   RESOURCE_SUSPEND_PREPARE,
   RESOURCE_SUSPEND_RESTORE,
   RESOURCE_SUSPEND_STREAM,
+  type LoadOnlyResource,
 } from './types'
 import type { StreamedSuspendResult } from './stream'
 import { SETTLED, suspendOn } from './suspense'
@@ -183,6 +185,17 @@ function createResourceSelector(
 ) {
   return new Proxy(state, {
     get(target, prop, receiver) {
+      if (
+        prop === 'suspend' &&
+        (descriptor as Partial<LoadOnlyResource>)[RESOURCE_LOAD_ONLY] === true
+      ) {
+        return () => {
+          throw new Error(
+            `[comwit] .suspend() is not available on "${path}": local resources are read with ` +
+              '.load() (local.query(), local.infinite()) or .restore() (local())'
+          )
+        }
+      }
       const selectorMethod = descriptor.selectorMethod ?? 'load'
       const isSuspend =
         prop === 'suspend' && selectorMethod === 'load' && descriptor.kind !== 'realtime'

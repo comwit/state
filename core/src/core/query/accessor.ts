@@ -431,6 +431,15 @@ export function createResourceAccessor(
     return seed === undefined ? undefined : materializeSeed(seed)
   }
 
+  /** Show a key's seed on the proxy: initial flags, the partial value, `isPartial: true`. */
+  const paintSeed = (seed: unknown) => {
+    runInternal(() => {
+      Object.assign(state, descriptor.initialState)
+      state.data = seed
+      state.isPartial = true
+    })
+  }
+
   const applyRemoteResult = (result: unknown, appendData: boolean, requestTokens: unknown[]) => {
     const shouldReconcile = lifecycleBindings.some((binding) => binding.afterApply)
     const previousState = shouldReconcile
@@ -591,25 +600,35 @@ export function createResourceAccessor(
 
     const currentFetchId = ++runtime.fetchId
 
+    // A key without a full result paints its seed while the upgrade runs, whatever staleTime says.
+    // Read once here: a durable restore below may turn the key into a full value first.
+    let seed = entry.hasQueried ? undefined : readSeed(queryArg)
+
     // Lifecycle adapters may restore an exact durable view before the remote driver runs.
     if (lifecycleBindings.length > 0 && !entry.resourceHydrated && !entry.hasQueried) {
       const isArgChange = !isRefetch && activeEntryBefore?.hasQueried
       const hasPlaceholderData = effectiveOptions.placeholderData !== undefined
 
-      if (isArgChange && !hasPlaceholderData) {
-        runInternal(() => Object.assign(state, descriptor.initialState))
-      }
-      runInternal(() =>
-        applyPlaceholderData(
-          state as ResourceBaseState<unknown>,
-          queryArg as never,
-          effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
+      if (seed !== undefined) {
+        // The seed shows synchronously, before the durable view is even read.
+        paintSeed(seed)
+      } else {
+        // Leaving a seeded key for an unseeded one never carries the seed along.
+        if ((isArgChange && !hasPlaceholderData) || state.isPartial === true) {
+          runInternal(() => Object.assign(state, descriptor.initialState))
+        }
+        runInternal(() =>
+          applyPlaceholderData(
+            state as ResourceBaseState<unknown>,
+            queryArg as never,
+            effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
+          )
         )
-      )
+      }
 
       state.isError = false
       state.error = null
-      state.isLoading = !state.isSuccess
+      state.isLoading = seed === undefined && !state.isSuccess
       state.isFetching = true
       runtime.slowLoading?.sync()
 
@@ -631,6 +650,8 @@ export function createResourceAccessor(
           state.isSuccess = true
           state.isError = false
           state.error = null
+          // A restored durable view is the key's full value: it replaces the seed like a fetch.
+          if (tracksPartial) state.isPartial = false
         })
         entry.hasQueried = true
         entry.lastFetchedAt = hydrated.fetchedAt
@@ -641,6 +662,7 @@ export function createResourceAccessor(
             ? { data: hydrated.data, ...hydrated.state }
             : hydrated.data)
         updateCachedState(entry, state)
+        seed = undefined
       }
     }
 
@@ -665,17 +687,11 @@ export function createResourceAccessor(
     // Determine if args changed (new cache entry, not a refetch)
     const isArgChange = !isRefetch && !entry.hasQueried && activeEntryBefore?.hasQueried
     const hasPlaceholderData = effectiveOptions.placeholderData !== undefined
-    // A key without a full result paints its seed while the upgrade runs, whatever staleTime says.
-    const seed = entry.hasQueried ? undefined : readSeed(queryArg)
     // A seed on the proxy belongs to the key that showed it; never leave it under another key.
     const leavesSeed = state.isPartial === true
 
     if (seed !== undefined) {
-      runInternal(() => {
-        Object.assign(state, descriptor.initialState)
-        state.data = seed
-        state.isPartial = true
-      })
+      paintSeed(seed)
     } else {
       // When args change and no placeholderData, reset to initial state
       if ((isArgChange && !hasPlaceholderData) || leavesSeed) {

@@ -204,6 +204,14 @@ Rules:
 - Seeds are per key. Changing the argument never shows another key's seed, and several mounted
   readers each paint their own key.
 
+`local.query()` takes the same `seed` through the same third generic. Local resources are read with
+`.load(id)` (`local()` with `.restore(id)`); `.suspend()` is not available on them, as a type error
+and as a thrown error for untyped callers, because suspending would bypass the durable restore.
+With a seed, `.load(id)` paints it synchronously (`isPartial: true`, never `isLoading`), the
+IndexedDB view stored for the key then replaces it as a full value (`isPartial: false`, like
+`hydrate()`), and the network revalidates per `staleTime`. Without a stored row the seed stays
+until the network result. A key already restored in this provider never shows its seed again.
+
 Reading another model (experimental): the seed context also offers `read(model)` for a seed whose
 source lives in another domain's model:
 
@@ -223,8 +231,8 @@ current snapshots when the key is read, so a later change to the other model doe
 key that already painted.
 
 `seed` differs from `placeholderData`: a placeholder keeps *another key's* full result visible
-while a new key loads; a seed is the *same key's* partial value. Infinite, realtime and
-`local.query()` resources do not take a seed.
+while a new key loads; a seed is the *same key's* partial value. Infinite and realtime resources
+do not take a seed.
 
 ### Slow initial loading
 

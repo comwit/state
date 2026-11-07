@@ -1,6 +1,7 @@
 import {
   action,
   create,
+  local,
   model,
   query,
   type Query,
@@ -213,4 +214,82 @@ const crossDetail = query<Detail | null, string, Summary>({
 })
 void crossDetail
 
-void [selectorContract, hydrationContract]
+// local.query() takes the same seed through the same third generic.
+const details = local.collection<Detail>({ key: 'details', version: 1 })
+const localDetail = local.query<Detail | null, string, Summary>({
+  source: details,
+  initialData: null,
+  queryFn: findDetail,
+  seed: (id, { state, read }) => {
+    void read
+    return state.list.data.find((item: Summary) => item.id === id)
+  },
+})
+const localPlain = local.query<Detail | null, string>({
+  source: details,
+  initialData: null,
+  queryFn: findDetail,
+})
+local.query<Detail | null, string>({
+  source: details,
+  initialData: null,
+  queryFn: findDetail,
+  // @ts-expect-error seed requires the third generic
+  seed: () => ({ id: 'a', title: 'b' }),
+})
+// @ts-expect-error a local seed may not carry keys the full value lacks
+local.query<Detail | null, string, WithExtraKey>({
+  source: details,
+  initialData: null,
+  queryFn: findDetail,
+  seed: () => null,
+})
+// @ts-expect-error a local seed field must keep the full value's type
+local.query<Detail | null, string, WithMismatch>({
+  source: details,
+  initialData: null,
+  queryFn: findDetail,
+  seed: () => null,
+})
+const localAliased: Query<Detail | null, string, Summary> = localDetail
+// @ts-expect-error a seeded local query is not a plain Query
+const localNotPlain: Query<Detail | null, string> = localDetail
+void [localAliased, localNotPlain]
+
+const localCatalog = model({ localDetail, localPlain })
+const useLocalCatalog = create(localCatalog, { actions: [] })
+
+function localSelectorContract() {
+  const result = useLocalCatalog((state) => state.localDetail.load('a'))
+  const union: SeededSingleResourceState<Detail | null, Summary> = result
+  void union
+  if (result.isPartial) {
+    const title: string = result.data.title
+    const description: string | undefined = result.data.description
+    // @ts-expect-error detail-only fields are optional while partial
+    const required: string = result.data.description
+    const notLoading: false = result.isLoading
+    void [title, description, required, notLoading]
+  } else {
+    const full: Detail | null = result.data
+    void full
+  }
+
+  const plainResult = useLocalCatalog((state) => state.localPlain.load('a'))
+  const plainData: Detail | null = plainResult.data
+  // @ts-expect-error unseeded local queries do not report isPartial
+  plainResult.isPartial
+  void plainData
+}
+
+const localActions = action(({ state }) => ({
+  flag() {
+    const partial: boolean = state(localCatalog).localDetail.isPartial
+    // @ts-expect-error unseeded bound local resources do not report isPartial
+    state(localCatalog).localPlain.isPartial
+    return partial
+  },
+}))
+void localActions
+
+void [selectorContract, hydrationContract, localSelectorContract]

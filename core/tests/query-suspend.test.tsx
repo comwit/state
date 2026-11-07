@@ -6,7 +6,6 @@ import {
   action,
   ComwitProvider,
   keepPreviousData,
-  local,
   model,
   query,
   useAction,
@@ -235,42 +234,6 @@ describe('query selector suspend', () => {
 
     await waitFor(() => expect(screen.getByTestId('error')).toBeDefined())
     consoleError.mockRestore()
-  })
-
-  test('stages local.query remotely and reconciles its lifecycle only after commit', async () => {
-    const collection = local.collection<{ id: string }>({ key: 'suspend-items', version: 1 })
-    const request = deferred<{ id: string }>()
-    const queryFn = vi.fn(() => request.promise)
-    const resource = model({
-      detail: local.query<{ id: string } | null, string>({
-        source: collection,
-        initialData: null,
-        queryFn,
-      }),
-    })
-
-    function View() {
-      const detail = useModel(resource, (state) => state.detail.suspend('one'))
-      return <div data-testid="local-detail">{detail.data?.id}</div>
-    }
-
-    await renderAsync(
-      <ComwitProvider>
-        <Suspense fallback={<div data-testid="local-fallback">loading</div>}>
-          <View />
-        </Suspense>
-      </ComwitProvider>
-    )
-
-    expect(screen.getByTestId('local-fallback')).toBeDefined()
-    expect(queryFn).toHaveBeenCalledOnce()
-
-    await act(async () => {
-      request.resolve({ id: 'one' })
-      await request.promise
-    })
-
-    await waitFor(() => expect(screen.getByTestId('local-detail').textContent).toBe('one'))
   })
 
   test('reports streaming query drivers as unsupported instead of partially committing data', async () => {
