@@ -507,8 +507,24 @@ export function useModel<T extends object, R>(
 
   useCommitEffect(() => {
     if (!queryRegistry || queryLoads.length === 0) return
-    // `load(key)` owners confirm here, ahead of their passive fetch; `suspend(key)` owners
-    // confirm inside commitSuspend.
+    for (const load of queryLoads) {
+      load.resume = undefined
+      if (!load.owner) continue
+      const runtime = queryRegistry.boundResourceRuntime.get(load.controller)
+      if (!runtime || follow.owned.get(runtime) !== load.key) continue
+      // Re-running with the key this owner already confirmed (a kept-alive page shown again,
+      // StrictMode): resume the key the page last showed instead of re-asserting the render
+      // key. While the page was visible a confirm from elsewhere (an action, a child owner) may
+      // have moved its pins; re-asserting would flip the page back to content it no longer
+      // renders. Mount and a key change assert the owner's key as before.
+      const pinned = follow.pins.get(runtime)?.key
+      const entry = pinned === undefined ? undefined : runtime.cacheEntries.get(pinned)
+      if (pinned !== undefined && pinned !== load.key && entry) {
+        load.resume = { key: pinned, arg: entry.arg }
+      }
+    }
+    // Owners confirm here, ahead of their fetch: `load(key)` before its passive fetch,
+    // `suspend(key)` before `commitSuspend` and its in-flight dedupe.
     activateQuerySelectorOwners(queryLoads)
     commitQuerySelectorSuspenseLoads(queryLoads, queryRegistry)
     for (const load of queryLoads) {
@@ -525,6 +541,17 @@ export function useModel<T extends object, R>(
     for (const runtime of followed) {
       const pin = follow.pins.get(runtime)
       if (!pin || pin.confirmed) continue
+      // A pin still equal to `stagedKey` after this commit's layout phase was staged by a tree
+      // that never committed (a page mounted hidden, a discarded render): nobody confirmed it.
+      // Clear the stale stage so it misleads no later follower.
+      if (
+        runtime.stagedKey !== undefined &&
+        runtime.stagedKey === pin.key &&
+        runtime.activeKey !== pin.key
+      ) {
+        runtime.stagedKey = undefined
+        runtime.stagedArg = undefined
+      }
       const changed = pin.key !== runtime.activeKey
       pin.key = runtime.activeKey
       pin.confirmed = true

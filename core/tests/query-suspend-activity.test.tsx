@@ -472,6 +472,98 @@ describe('per-component pinned keys for argument-less reads', () => {
     }
   })
 
+  test('a suspend owner shown again while its own background refresh is still pending re-activates its key', async () => {
+    const queue = new Map<string, Array<ReturnType<typeof deferred<Post>>>>()
+    const next = (id: string) => {
+      const d = deferred<Post>()
+      if (!queue.has(id)) queue.set(id, [])
+      queue.get(id)!.push(d)
+      return d
+    }
+    const t = setupPosts((id) => next(id).promise)
+    const view = await renderAsync(<t.Routes show="a" pages={['a']} Page={t.SuspendPage} />)
+    await act(async () => {
+      queue.get('a')![0].resolve({ id: 'a', title: 'a', likes: 0 })
+      await queue.get('a')![0].promise
+    })
+    expect(screen.getByTestId('title-a').textContent).toBe('a')
+
+    await act(async () => {
+      view.rerender(<t.Routes show="b" pages={['a', 'b']} Page={t.SuspendPage} />)
+    })
+    await act(async () => {
+      queue.get('b')![0].resolve({ id: 'b', title: 'b', likes: 0 })
+      await queue.get('b')![0].promise
+    })
+    expect(t.runtime().activeKey).toBe(key('b'))
+
+    // Back to A: its owner confirms 'a' and starts a background refresh that stays pending.
+    await act(async () => {
+      view.rerender(<t.Routes show="a" pages={['a', 'b']} Page={t.SuspendPage} />)
+    })
+    expect(t.runtime().activeKey).toBe(key('a'))
+    expect(queue.get('a')).toHaveLength(2)
+
+    await act(async () => {
+      view.rerender(<t.Routes show="b" pages={['a', 'b']} Page={t.SuspendPage} />)
+    })
+    expect(t.runtime().activeKey).toBe(key('b'))
+
+    // Back to A again while A's refresh is still in flight: the owner's activation must not hide
+    // behind the in-flight dedupe, or actions on the visible page would edit B's item.
+    await act(async () => {
+      view.rerender(<t.Routes show="a" pages={['a', 'b']} Page={t.SuspendPage} />)
+    })
+    expect(screen.getByTestId('title-a').textContent).toBe('a')
+    expect(t.runtime().activeKey).toBe(key('a'))
+    expect(t.actions().current()?.id).toBe('a')
+    expect(queue.get('a')).toHaveLength(2)
+
+    // The pending refresh lands in the field once it settles.
+    await act(async () => {
+      queue.get('a')![1].resolve({ id: 'a', title: 'a fresh', likes: 0 })
+      await queue.get('a')![1].promise
+    })
+    expect(screen.getByTestId('title-a').textContent).toBe('a fresh')
+    expect(t.actions().current()?.title).toBe('a fresh')
+  })
+
+  test('a page mounted hidden and never shown leaves no stale stagedKey for later followers', async () => {
+    const t = setupPosts(immediate)
+    function Late({ name }: { name: string }) {
+      const [shown, setShown] = useState(false)
+      return (
+        <>
+          <button onClick={() => setShown(true)}>mount {name}</button>
+          {shown && <t.Title name={name} />}
+        </>
+      )
+    }
+    // 'p' is mounted hidden from the start (a prerendered route) and never shown.
+    await renderAsync(
+      <t.Routes show="a" pages={['a', 'p']} Page={t.SuspendPage}>
+        <Late name="late-1" />
+        <Late name="late-2" />
+      </t.Routes>
+    )
+    expect(screen.getByTestId('title-a').textContent).toBe('a')
+    expect(t.runtime().activeKey).toBe(key('a'))
+
+    // The first follower mounted afterwards may pin the stale stage once; it repairs itself and
+    // clears the stage, so it misleads nobody else.
+    await act(async () => {
+      screen.getByText('mount late-1').click()
+    })
+    expect(screen.getByTestId('late-1').textContent).toBe('a')
+    expect(t.runtime().stagedKey).toBeUndefined()
+
+    t.log.length = 0
+    await act(async () => {
+      screen.getByText('mount late-2').click()
+    })
+    expect(t.rendersOf('late-2')).toEqual(['a'])
+  })
+
   test('without an owner, followers read the active key as before', async () => {
     const t = setupPosts(immediate)
     await renderAsync(
@@ -526,9 +618,25 @@ describe('argument-less load() follows the current key', () => {
       useModel(catalog, (s) => (page === null ? null : s.list.load({ page }).isFetching))
       return <button onClick={() => setPage(2)}>page 2</button>
     }
+    /** An argument-less `load()` beside an owner: it follows that owner's key, never its own. */
+    function Ensure() {
+      useModel(catalog, (s) => s.list.load().isFetching)
+      return null
+    }
+    function OwnedPage() {
+      const list = useModel(catalog, (s) => s.list.load({ page: 1 }))
+      log.push(`page:${list.data.join(',') || 'pending'}`)
+      return (
+        <section>
+          <h1 data-testid="h">{list.data.join(',') || 'pending'}</h1>
+          <Ensure />
+          <Items name="items" />
+        </section>
+      )
+    }
     function ListPage({ pager }: { pager: boolean }) {
       // Top-level `load()` with defaults in queryFn: loads the current key, never chooses one.
-      const list = useModel(catalog, (s) => (s.list.load as unknown as () => typeof s.list)())
+      const list = useModel(catalog, (s) => s.list.load())
       log.push(`page:${list.data.join(',') || 'pending'}`)
       return (
         <section>
@@ -538,12 +646,20 @@ describe('argument-less load() follows the current key', () => {
         </section>
       )
     }
-    function App({ show, pager = false }: { show: boolean; pager?: boolean }) {
+    function App({
+      show,
+      pager = false,
+      owned = false,
+    }: {
+      show: boolean
+      pager?: boolean
+      owned?: boolean
+    }) {
       return (
         <ComwitProvider>
           <Probe />
           <Activity mode={show ? 'visible' : 'hidden'}>
-            <ListPage pager={pager} />
+            {owned ? <OwnedPage /> : <ListPage pager={pager} />}
           </Activity>
         </ComwitProvider>
       )
@@ -552,12 +668,14 @@ describe('argument-less load() follows the current key', () => {
       App,
       queryFn,
       log,
+      rendersOf: (name: string) =>
+        log.filter((line) => line.startsWith(`${name}:`)).map((line) => line.slice(name.length + 1)),
       actions: () => actions,
       runtime: () => runtimeOf(registry, catalog, 'list'),
     }
   }
 
-  test('load({ page: 2 }) from a child re-pins every visible follower, and the page keeps it when shown again', async () => {
+  test('load({ page: 2 }) from a child re-pins every visible follower; after an action moved on, showing the page again resumes the page it last showed', async () => {
     const t = setupCatalog()
     const view = await renderAsync(<t.App show pager />)
     expect(screen.getByTestId('h').textContent).toBe('page-1')
@@ -585,6 +703,43 @@ describe('argument-less load() follows the current key', () => {
     expect(t.log.every((line) => line.endsWith(':page-2'))).toBe(true)
     expect(t.queryFn.mock.calls.filter(([params]) => params === undefined)).toHaveLength(1)
     expect(t.runtime().activeKey).toBe(key({ page: 2 }))
+
+    // An action moves the page on while the child owner still renders `load({ page: 2 })`.
+    await act(async () => {
+      await t.actions().goto(3)
+    })
+    expect(screen.getByTestId('h').textContent).toBe('page-3')
+    expect(screen.getByTestId('items').textContent).toBe('page-3')
+
+    // Shown again, the child owner's effect re-runs with its unchanged key. It resumes page 3,
+    // the page its component last showed, instead of flipping the page back to page 2.
+    for (let cycle = 0; cycle < 2; cycle++) {
+      await act(async () => {
+        view.rerender(<t.App show={false} pager />)
+      })
+      t.log.length = 0
+      t.queryFn.mockClear()
+      await act(async () => {
+        view.rerender(<t.App show pager />)
+      })
+      expect(screen.getByTestId('h').textContent).toBe('page-3')
+      expect(screen.getByTestId('items').textContent).toBe('page-3')
+      expect(t.log.every((line) => line.endsWith(':page-3'))).toBe(true)
+      expect(t.queryFn).not.toHaveBeenCalledWith({ page: 2 }, expect.any(Object))
+      expect(t.runtime().activeKey).toBe(key({ page: 3 }))
+    }
+  })
+
+  test('an argument-less load() beside a mounting owner follows that owner from the first render and fetches nothing of its own', async () => {
+    const t = setupCatalog()
+    await renderAsync(<t.App show owned />)
+    // Pending until the owner's fetch lands, then its page: the argument-less load() beside it
+    // never moved the field to the `undefined` key in between.
+    expect([...new Set(t.rendersOf('items'))]).toEqual(['pending', 'page-1'])
+    expect(screen.getByTestId('h').textContent).toBe('page-1')
+    expect(t.runtime().activeKey).toBe(key({ page: 1 }))
+    expect(t.queryFn).toHaveBeenCalledTimes(1)
+    expect(t.queryFn).toHaveBeenCalledWith({ page: 1 }, expect.any(Object))
   })
 
   test('load({ page: 3 }) from an action re-pins every visible follower, and the page keeps it when shown again', async () => {

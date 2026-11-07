@@ -372,6 +372,53 @@ describe('query.infinite()', () => {
       expect(historyAfterNext.length).toBeLessThan(lengthAfterNext)
     })
 
+    test('a previousFetch() that settles after another key took over keeps the popped history in its entry', async () => {
+      const restored = deferred<{ data: string[]; cursor: string; hasMore: boolean }>()
+      const queryFn = vi
+        .fn()
+        .mockResolvedValueOnce({ data: ['a'], cursor: 'c1', hasMore: true })
+        .mockResolvedValueOnce({ data: ['b'], cursor: 'c2', hasMore: true })
+        .mockResolvedValueOnce({ data: ['c'], cursor: 'c3', hasMore: true })
+        .mockReturnValueOnce(restored.promise)
+        .mockResolvedValueOnce({ data: ['other'], cursor: 'o1', hasMore: true })
+      const m = model({
+        feed: query.infinite<string[], string | undefined>({
+          initialData: [] as string[],
+          queryFn,
+        }),
+      })
+      const store = m.instance()
+      const registry = createQueryBindingRegistry()
+      const bound = bindResourceState(
+        store.proxy,
+        m.pluginBags.get('query')!,
+        undefined,
+        registry
+      ) as any
+
+      await bound.feed.query('mine')
+      await bound.feed.nextFetch()
+      await bound.feed.nextFetch()
+      const runtime = registry.boundResourceRuntime.get(store.proxy.feed)!
+      const mine = runtime.cacheEntries.get(runtime.activeKey!)!
+      expect(mine.cursorHistory).toEqual(['c1', 'c2', 'c3'])
+
+      // Going back pops the last cursor and refetches the previous page; another key takes over
+      // before that request settles.
+      const back = bound.feed.previousFetch()
+      expect(mine.cursorHistory).toEqual(['c1', 'c2'])
+      await bound.feed.query('other')
+      restored.resolve({ data: ['a-restored'], cursor: 'c1', hasMore: true })
+      await back
+
+      // The result lands in its own entry with the history previousFetch left, as the active
+      // path keeps it for `restore`, instead of collapsing it to the one cursor.
+      expect(mine.hasQueried).toBe(true)
+      expect(mine.state.data).toEqual(['a-restored'])
+      expect(mine.cursorHistory).toEqual(['c1', 'c2'])
+      expect(runtime.activeKey).not.toBe(mine.key)
+    })
+
     test('re-query (replace mode) resets cursorHistory to length 1', async () => {
       const queryFn = vi
         .fn()

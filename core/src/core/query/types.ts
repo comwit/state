@@ -289,17 +289,35 @@ export type BoundRealtimeResourceState<TData, TArg = unknown> = ResourceRealtime
 
 type ResourceLoadController<TState, TArg> = [TArg] extends [void]
   ? { load(): TState }
-  : { load(arg: TArg): TState }
+  : undefined extends TArg
+    ? {
+        /**
+         * Loads the key this component follows (the owner above it, else the active key) and
+         * never chooses one for the page. With nothing active yet it loads the `undefined` key,
+         * so `queryFn` must accept `undefined` (`(params) => api.list(params ?? { page: 1 })`).
+         */
+        load(): TState
+        /** Owner: chooses the key for this page. */
+        load(arg: TArg): TState
+      }
+    : { load(arg: TArg): TState }
 
 type ResourceSuspendController<TState, TArg> = [TArg] extends [void]
   ? {
       /** Suspends during render until the query resolves; `queryFn` also runs on the server. */
       suspend(): TState
     }
-  : {
-      /** Suspends during render until the query resolves; `queryFn` also runs on the server. */
-      suspend(arg: TArg): TState
-    }
+  : undefined extends TArg
+    ? {
+        /** Suspends on the `undefined` key: `suspend` must know its key during render. */
+        suspend(): TState
+        /** Suspends during render until the query resolves; `queryFn` also runs on the server. */
+        suspend(arg: TArg): TState
+      }
+    : {
+        /** Suspends during render until the query resolves; `queryFn` also runs on the server. */
+        suspend(arg: TArg): TState
+      }
 
 export type SelectableSingleResourceState<TData, TArg = void, TSeed = never> = [TSeed] extends [
   never,
@@ -564,6 +582,12 @@ export type QueryCacheEntry = {
   suspendError?: Error
   /** Whether the staged result still needs to become the active proxy after commit. */
   suspendNeedsCommit?: boolean
+  /**
+   * Whether this key's `.suspend()` owner loads it behind the previous result
+   * (`placeholderData`). Decided against the key active before it when the owner activates in
+   * the layout phase; consumed by `commitSuspend`.
+   */
+  loadBehindPlaceholder?: boolean
   /** Whether the latest result came from a render-time `.suspend()` request in this registry. */
   suspendFetched?: boolean
   /** Whether resolved hydration still needs lifecycle persistence after commit. */
@@ -640,6 +664,8 @@ export type ResourceRuntimeState = {
    * Render-only: followers rendered after the owner pin it; it never touches the model field.
    */
   stagedKey?: QueryCacheKey
+  /** The argument behind `stagedKey`, for followers reading a key whose entry does not exist yet. */
+  stagedArg?: unknown
   /** Followers currently subscribed from their layout effect. */
   listeners: Set<QueryActivationListener>
   /**

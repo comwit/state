@@ -237,6 +237,7 @@ function cloneRuntime(path: string): ResourceRuntimeState {
     lastArg: undefined,
     activeKey: undefined,
     stagedKey: undefined,
+    stagedArg: undefined,
     listeners: new Set(),
     pinHolders: new Set(),
     fetchId: 0,
@@ -644,20 +645,31 @@ export function createResourceAccessor(
     }
 
     if (commit) {
-      if (key !== undefined) runtime.stagedKey = undefined
+      if (key !== undefined) {
+        runtime.stagedKey = undefined
+        runtime.stagedArg = undefined
+      }
       notifyListeners(key)
     }
     return entry
   }
   runtime.activate = activate
 
-  /** Selector owners confirm their key in the layout phase, before any fetch runs. */
-  const activateOwner = (arg: unknown, key: QueryCacheKey) => {
-    activate(key, arg)
+  /**
+   * Selector owners confirm their key in the layout phase, before any fetch runs and ahead of
+   * the in-flight dedupe. A `suspend` owner's key may load behind the previous result
+   * (`placeholderData`); that is decided against the key active before it, so it is read here
+   * and kept on the entry for `commitSuspend`.
+   */
+  const activateOwner = (arg: unknown, key: QueryCacheKey, mode: 'load' | 'suspend') => {
+    const placeholder = mode === 'suspend' && readSuspendPlaceholder(key) !== undefined
+    const entry = activate(key, arg)
+    if (mode === 'suspend' && entry && !entry.hasQueried) entry.loadBehindPlaceholder = placeholder
   }
 
   /** Land a settled request in its entry only: its key stopped being active while it ran. */
-  const settleEntry = (entry: QueryCacheEntry, result: unknown, appendData: boolean) => {
+  const settleEntry = (entry: QueryCacheEntry, result: unknown, mode: QueryMode) => {
+    const appendData = descriptor.kind === 'infinite' && mode === 'append'
     const next = structuredClone(
       entry.hasQueried ? entry.state : descriptor.initialState
     ) as ResourceDataLike
@@ -675,11 +687,13 @@ export function createResourceAccessor(
     entry.lastResult = result
     entry.suspendFetched = false
 
-    if (descriptor.kind === 'infinite') {
+    // Same history bookkeeping as the active path: `restore` already popped the cursor it
+    // returns to in `previousFetch`, so it leaves the history alone.
+    if (descriptor.kind === 'infinite' && mode !== 'restore') {
       const history = entry.cursorHistory
       const nextCursor = (next as ResourceInfiniteState<unknown>).cursor
-      if (appendData && history[history.length - 1] !== nextCursor) history.push(nextCursor)
-      else if (!appendData) entry.cursorHistory = [nextCursor]
+      if (mode === 'append' && history[history.length - 1] !== nextCursor) history.push(nextCursor)
+      else if (mode === 'replace') entry.cursorHistory = [nextCursor]
     }
   }
 
@@ -971,7 +985,7 @@ export function createResourceAccessor(
       // entry so a hidden page, or the page shown again, reads it instead of staying pending.
       // Lifecycle adapters persist through the active view, so they only see active results.
       if (!isActive()) {
-        settleEntry(entry, result, descriptor.kind === 'infinite' && mode === 'append')
+        settleEntry(entry, result, mode)
         return result
       }
 
@@ -1332,10 +1346,13 @@ export function createResourceAccessor(
   ): Promise<unknown> => {
     const queryArg = hasArg ? arg : undefined
     const entry = runtime.cacheEntries.get(key)
-    // Decided against the previous active key, so read it before this key takes over.
-    const placeholder = entry?.hasQueried ? undefined : readSuspendPlaceholder(key)
-    // The owner confirms its key in the layout phase whatever the entry holds, so followers that
-    // pinned the staged key settle before paint even when the request is gated or still pending.
+    // Decided against the key active before this one: by the owner's activation in the layout
+    // phase (`activateOwner`, which runs ahead of the in-flight dedupe), else here.
+    const placeholder =
+      entry?.loadBehindPlaceholder ??
+      (entry?.hasQueried ? false : readSuspendPlaceholder(key) !== undefined)
+    if (entry) entry.loadBehindPlaceholder = undefined
+    // Confirms again when the owner already activated this key; a direct commit activates here.
     activate(key, queryArg)
 
     if (!entry?.hasQueried) {
