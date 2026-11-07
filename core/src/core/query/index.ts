@@ -56,12 +56,15 @@ export {
 
 // React selector auto-load
 export {
+  activateQuerySelectorOwners,
+  createQueryFollowContext,
   createQuerySelectorState,
   commitQuerySelectorSuspenseLoads,
   prepareQuerySelectorSuspense,
   recordQuerySelectorSuspense,
   runQuerySelectorLoads,
   querySelectorLoadKey,
+  type QueryFollowContext,
   type QuerySelectorLoad,
 } from './select'
 

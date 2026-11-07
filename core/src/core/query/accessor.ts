@@ -3,6 +3,7 @@ import { isEqual } from '../../utils'
 import { DEFAULT_GC_TIME } from './registry'
 import { createSlowLoadingClock } from './slow-loading'
 import {
+  RESOURCE_ACTIVATE,
   RESOURCE_LIFECYCLE,
   RESOURCE_HYDRATE,
   RESOURCE_QUERY_OPTION_KEYS,
@@ -15,6 +16,7 @@ import {
   type ConnectionStatus,
   type InfiniteResourceDescriptor,
   type PlaceholderData,
+  type QueryActivateOptions,
   type QueryBindingRegistry,
   type QueryCacheEntry,
   type QueryCacheKey,
@@ -234,6 +236,9 @@ function cloneRuntime(path: string): ResourceRuntimeState {
     path,
     lastArg: undefined,
     activeKey: undefined,
+    stagedKey: undefined,
+    listeners: new Set(),
+    pinHolders: new Set(),
     fetchId: 0,
     cacheEntries: new Map(),
     gcTime: DEFAULT_GC_TIME,
@@ -253,7 +258,26 @@ function createCacheEntry(
     lastFetchedAt: 0,
     cursorHistory: [],
     state: snapshot(state) as ResourceDataLike,
+    fetchSeq: 0,
   }
+}
+
+/**
+ * Whether a mounted component (visible or kept alive in a hidden `<Activity>`) still pins this
+ * key. Holders are weak: an unmounted component releases its pins once collected, while a
+ * hidden page, whose effects are torn down but whose fiber stays alive, keeps them.
+ */
+export function isKeyPinned(runtime: ResourceRuntimeState, key: QueryCacheKey): boolean {
+  let pinned = false
+  for (const holder of runtime.pinHolders) {
+    const pins = holder.deref()
+    if (!pins) {
+      runtime.pinHolders.delete(holder)
+      continue
+    }
+    if (pins.get(runtime)?.key === key) pinned = true
+  }
+  return pinned
 }
 
 function applyCachedState(target: ResourceDataLike, cached: QueryCacheEntry) {
@@ -299,19 +323,31 @@ export function scheduleModelGc(registry: QueryBindingRegistry, modelKey: symbol
   for (const runtime of runtimes) {
     runtime.slowLoading?.pause()
     for (const [key] of runtime.cacheEntries) {
-      if (runtime.gcTimers.has(key)) continue
-      const timer = setTimeout(() => {
-        runtime.gcTimers.delete(key)
-        runtime.cacheEntries.delete(key)
-        if (runtime.activeKey === key) {
-          runtime.slowLoading?.reset()
-          runtime.activeKey = undefined
-          runtime.lastArg = undefined
-        }
-      }, runtime.gcTime)
-      runtime.gcTimers.set(key, timer)
+      scheduleEntryGc(runtime, key)
     }
   }
+}
+
+function scheduleEntryGc(runtime: ResourceRuntimeState, key: QueryCacheKey) {
+  if (runtime.gcTimers.has(key)) return
+  const timer = setTimeout(() => {
+    runtime.gcTimers.delete(key)
+    // A hidden page still pins this entry; try again after another gcTime.
+    if (isKeyPinned(runtime, key)) {
+      scheduleEntryGc(runtime, key)
+      return
+    }
+    runtime.cacheEntries.delete(key)
+    if (runtime.activeKey === key) {
+      if (runtime.activate) runtime.activate(undefined, undefined, { commit: true })
+      else {
+        runtime.slowLoading?.reset()
+        runtime.activeKey = undefined
+        runtime.lastArg = undefined
+      }
+    }
+  }, runtime.gcTime)
+  runtime.gcTimers.set(key, timer)
 }
 
 /**
@@ -492,6 +528,175 @@ export function createResourceAccessor(
     return runtime.cacheEntries.get(runtime.activeKey)
   }
 
+  const passesGates = () => {
+    if (descriptor.enabled && modelState && !descriptor.enabled(modelState)) return false
+    if (descriptor.dependsOn && modelState) {
+      const dep = descriptor.dependsOn(modelState)
+      if (dep && typeof dep === 'object' && 'isSuccess' in dep) {
+        if (!dep.isSuccess) return false
+      } else if (dep === null || dep === undefined) {
+        return false
+      }
+    }
+    return true
+  }
+
+  const resolvePlaceholderData = (override?: PlaceholderData<unknown, unknown>) =>
+    override !== undefined
+      ? override
+      : normalizeDescriptorOptions<unknown, unknown>(descriptor, defaults, undefined)
+          .placeholderData
+
+  const notifyListeners = (key: QueryCacheKey | undefined) => {
+    for (const listener of [...runtime.listeners]) listener(key)
+  }
+
+  /** Get or create the entry for a key, record its argument and cancel a pending eviction. */
+  const ensureEntry = (key: QueryCacheKey, arg: unknown): QueryCacheEntry => {
+    let entry = runtime.cacheEntries.get(key)
+    if (!entry) {
+      entry = createCacheEntry(state, key, arg)
+      runtime.cacheEntries.set(key, entry)
+    } else {
+      const pending = runtime.gcTimers.get(key)
+      if (pending !== undefined) {
+        clearTimeout(pending)
+        runtime.gcTimers.delete(key)
+      }
+    }
+    entry.arg = arg
+    return entry
+  }
+
+  /**
+   * The only way `activeKey` changes. Every writer (`executeQuery`, `commitSuspend`,
+   * `setResource`, `hydrateResource`, `activateStagedEntry`, the gc reset) goes through here so
+   * the model field, the entry cache and follower pins stay consistent:
+   *
+   * 1. the outgoing key's committed field is written back into its entry, so edits made through
+   *    actions survive the switch (hidden pages and revisits read the entry);
+   * 2. `activeKey` moves and the entry is mirrored into the field: its cached state once queried,
+   *    otherwise the key's seed, else the initial / `placeholderData` state a fresh fetch starts
+   *    from;
+   * 3. with `commit`, `stagedKey` is cleared and subscribed followers are confirmed with the key.
+   *
+   * Re-activating the key that is already active leaves the field alone (a request may be in
+   * flight) and only confirms. Render-time activations (`activateStagedEntry`) stop after step 2;
+   * the owner's commit confirms.
+   */
+  const activate = (
+    key: QueryCacheKey | undefined,
+    arg: unknown,
+    options: QueryActivateOptions = {}
+  ): QueryCacheEntry | undefined => {
+    const commit = options.commit !== false
+    const outgoing = getActiveEntry()
+    let entry: QueryCacheEntry | undefined
+
+    if (key !== undefined && key !== runtime.activeKey) {
+      if (outgoing && outgoing.hasQueried && !outgoing.suspendNeedsCommit) {
+        updateCachedState(outgoing, state)
+      }
+      runtime.slowLoading?.reset()
+      runtime.lastArg = arg
+      runtime.activeKey = key
+      // Adapters may invalidate the whole entry cache here (a `local` scope change), so the
+      // entry is looked up only afterwards.
+      activateLifecycle(key, arg)
+      const next = ensureEntry(key, arg)
+      entry = next
+
+      if (next.hasQueried) {
+        runInternal(() => applyCachedState(state, next))
+      } else {
+        const seed = readSeed(arg)
+        if (seed !== undefined) {
+          // A key without a full result shows its seed from the first commit; the fetch that
+          // follows upgrades it in the background.
+          paintSeed(seed)
+        } else {
+          // The state a fetch for this key starts from: `isLoading` until its first result, with
+          // the previous item kept visible only through `placeholderData`. The fetch itself sets
+          // `isFetching` when it starts, so a gated key never looks like it is requesting.
+          const placeholderData = resolvePlaceholderData(options.placeholderData)
+          runInternal(() => {
+            // A seed on the field belongs to the key that showed it; never leave it under
+            // another key, not even as the previous data a placeholder starts from.
+            if (placeholderData === undefined || state.isPartial === true) {
+              Object.assign(state, structuredClone(descriptor.initialState))
+            }
+            applyPlaceholderData(state as ResourceBaseState<unknown>, arg as never, placeholderData)
+            state.isLoading = !state.isSuccess
+            state.isError = false
+            state.error = null
+            state.isFetching = false
+          })
+        }
+      }
+    } else if (key !== undefined) {
+      runtime.lastArg = arg
+      activateLifecycle(key, arg)
+      entry = ensureEntry(key, arg)
+    } else if (runtime.activeKey !== undefined) {
+      runtime.slowLoading?.reset()
+      runtime.activeKey = undefined
+      runtime.lastArg = undefined
+    }
+
+    if (commit) {
+      if (key !== undefined) runtime.stagedKey = undefined
+      notifyListeners(key)
+    }
+    return entry
+  }
+  runtime.activate = activate
+
+  /** Selector owners confirm their key in the layout phase, before any fetch runs. */
+  const activateOwner = (arg: unknown, key: QueryCacheKey) => {
+    activate(key, arg)
+  }
+
+  /** Land a settled request in its entry only: its key stopped being active while it ran. */
+  const settleEntry = (entry: QueryCacheEntry, result: unknown, appendData: boolean) => {
+    const next = structuredClone(
+      entry.hasQueried ? entry.state : descriptor.initialState
+    ) as ResourceDataLike
+    mergeResult(next, result, appendData)
+    next.isLoading = false
+    next.isFetching = false
+    next.isSuccess = true
+    next.isError = false
+    next.error = null
+    if ('isSlowLoading' in next) next.isSlowLoading = false
+
+    entry.state = immutableResourceState(next)
+    entry.hasQueried = true
+    entry.lastFetchedAt = Date.now()
+    entry.lastResult = result
+    entry.suspendFetched = false
+
+    if (descriptor.kind === 'infinite') {
+      const history = entry.cursorHistory
+      const nextCursor = (next as ResourceInfiniteState<unknown>).cursor
+      if (appendData && history[history.length - 1] !== nextCursor) history.push(nextCursor)
+      else if (!appendData) entry.cursorHistory = [nextCursor]
+    }
+  }
+
+  const settleEntryError = (entry: QueryCacheEntry, error: unknown) => {
+    const next = structuredClone(
+      entry.hasQueried ? entry.state : descriptor.initialState
+    ) as ResourceDataLike
+    next.isLoading = false
+    next.isFetching = false
+    next.isError = true
+    next.error = normalizeError(error)
+    next.isSuccess =
+      entry.hasQueried && lifecycleBindings.some((binding) => binding.preserveSuccessOnError)
+    if ('isSlowLoading' in next) next.isSlowLoading = false
+    entry.state = immutableResourceState(next)
+  }
+
   function clearRefetchInterval() {
     if (runtime.refetchIntervalId != null) {
       clearInterval(runtime.refetchIntervalId)
@@ -526,44 +731,12 @@ export function createResourceAccessor(
     mode: QueryMode,
     isRefetch = false
   ): Promise<unknown> => {
-    // Check enabled condition
-    if (descriptor.enabled && modelState) {
-      if (!descriptor.enabled(modelState)) {
-        return
-      }
-    }
-
-    // Check dependsOn condition
-    if (descriptor.dependsOn && modelState) {
-      const dep = descriptor.dependsOn(modelState)
-      if (dep && typeof dep === 'object' && 'isSuccess' in dep) {
-        if (!dep.isSuccess) return
-      } else if (dep === null || dep === undefined) {
-        return
-      }
-    }
+    if (!passesGates()) return
 
     const activeEntryBefore = getActiveEntry()
     // A refetch needs an active key with a result; a key still showing its seed upgrades instead.
     if (isRefetch && !activeEntryBefore?.hasQueried && state.isPartial !== true) {
       return
-    }
-
-    // Check enabled condition
-    if (descriptor.enabled && modelState) {
-      if (!descriptor.enabled(modelState)) {
-        return
-      }
-    }
-
-    // Check dependsOn condition
-    if (descriptor.dependsOn && modelState) {
-      const dep = descriptor.dependsOn(modelState)
-      if (dep && typeof dep === 'object' && 'isSuccess' in dep) {
-        if (!dep.isSuccess) return
-      } else if (dep === null || dep === undefined) {
-        return
-      }
     }
 
     const effectiveOptions = normalizeDescriptorOptions<unknown, unknown>(
@@ -579,26 +752,19 @@ export function createResourceAccessor(
 
     const queryArg = isRefetch ? activeEntryBefore?.arg : hasArg ? arg : runtime.lastArg
     const queryKey = serializeResourceArg(descriptor, queryArg)
-    if (runtime.activeKey !== queryKey) runtime.slowLoading?.reset()
-    runtime.lastArg = queryArg
-    runtime.activeKey = queryKey
-    activateLifecycle(queryKey, queryArg)
-
-    let entry = runtime.cacheEntries.get(queryKey)
-    if (!entry) {
-      entry = createCacheEntry(state, queryKey, queryArg)
-      runtime.cacheEntries.set(queryKey, entry)
-    } else {
-      const pending = runtime.gcTimers.get(queryKey)
-      if (pending !== undefined) {
-        clearTimeout(pending)
-        runtime.gcTimers.delete(queryKey)
-      }
-    }
-
-    entry.arg = queryArg
+    const entry = activate(queryKey, queryArg, {
+      placeholderData: effectiveOptions.placeholderData as
+        | PlaceholderData<unknown, unknown>
+        | undefined,
+    }) as QueryCacheEntry
 
     const currentFetchId = ++runtime.fetchId
+    const fetchSeq = ++entry.fetchSeq
+    /** Still the newest request for this key, with its entry still cached. */
+    const isCurrent = () =>
+      runtime.cacheEntries.get(queryKey) === entry && entry.fetchSeq === fetchSeq
+    /** The model field mirrors this key, so results also apply to it. */
+    const isActive = () => runtime.activeKey === queryKey
 
     // A key without a full result paints its seed while the upgrade runs, whatever staleTime says.
     // Read once here: a durable restore below may turn the key into a full value first.
@@ -606,25 +772,9 @@ export function createResourceAccessor(
 
     // Lifecycle adapters may restore an exact durable view before the remote driver runs.
     if (lifecycleBindings.length > 0 && !entry.resourceHydrated && !entry.hasQueried) {
-      const isArgChange = !isRefetch && activeEntryBefore?.hasQueried
-      const hasPlaceholderData = effectiveOptions.placeholderData !== undefined
-
-      if (seed !== undefined) {
-        // The seed shows synchronously, before the durable view is even read.
-        paintSeed(seed)
-      } else {
-        // Leaving a seeded key for an unseeded one never carries the seed along.
-        if ((isArgChange && !hasPlaceholderData) || state.isPartial === true) {
-          runInternal(() => Object.assign(state, descriptor.initialState))
-        }
-        runInternal(() =>
-          applyPlaceholderData(
-            state as ResourceBaseState<unknown>,
-            queryArg as never,
-            effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
-          )
-        )
-      }
+      // A key change already reset the field, applied `placeholderData` or painted the seed in
+      // `activate()`; the seed shows synchronously, before the durable view is even read.
+      if (seed !== undefined) paintSeed(seed)
 
       state.isError = false
       state.error = null
@@ -684,28 +834,10 @@ export function createResourceAccessor(
       runInternal(() => applyCachedState(state, entry))
     }
 
-    // Determine if args changed (new cache entry, not a refetch)
-    const isArgChange = !isRefetch && !entry.hasQueried && activeEntryBefore?.hasQueried
-    const hasPlaceholderData = effectiveOptions.placeholderData !== undefined
-    // A seed on the proxy belongs to the key that showed it; never leave it under another key.
-    const leavesSeed = state.isPartial === true
-
-    if (seed !== undefined) {
-      paintSeed(seed)
-    } else {
-      // When args change and no placeholderData, reset to initial state
-      if ((isArgChange && !hasPlaceholderData) || leavesSeed) {
-        runInternal(() => Object.assign(state, descriptor.initialState))
-      }
-
-      runInternal(() =>
-        applyPlaceholderData(
-          state as ResourceBaseState<unknown>,
-          queryArg as never,
-          effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
-        )
-      )
-    }
+    // A key change already reset the field or applied `placeholderData` in `activate()`. A key
+    // without a full result shows its seed while the upgrade runs (also when the same key
+    // refetches its seed).
+    if (seed !== undefined) paintSeed(seed)
 
     if (descriptor.kind === 'infinite' && mode !== 'restore') {
       const infiniteHistory = entry.cursorHistory
@@ -728,17 +860,9 @@ export function createResourceAccessor(
 
     state.isError = false
     state.error = null
-    // When a seed is shown, the upgrade is a background fetch (isLoading=false)
-    // When args changed without placeholderData, this is a fresh load (isLoading=true)
-    // When args changed with placeholderData, previous data is kept (isLoading=false)
-    // When refetching same arg, data is kept (isLoading=false)
-    if (seed !== undefined) {
-      state.isLoading = false
-    } else if (isArgChange && !hasPlaceholderData) {
-      state.isLoading = true
-    } else {
-      state.isLoading = !state.isSuccess
-    }
+    // A fresh key (reset by `activate()`) loads; a key that already has data, keeps the previous
+    // result through placeholderData, or shows its seed (a background upgrade) only fetches.
+    state.isLoading = seed === undefined && !state.isSuccess
     state.isFetching = true
     runtime.slowLoading?.sync()
 
@@ -778,12 +902,17 @@ export function createResourceAccessor(
         )
       }
 
-      if (runtime.fetchId !== currentFetchId) {
+      // A newer request, `.set()` or hydration for this key replaced this one.
+      if (!isCurrent()) {
         return result
       }
 
-      // Handle AsyncIterable (streaming) results
+      // Handle AsyncIterable (streaming) results. Chunks apply to the live field, so a stream
+      // keeps the runtime-wide guard: any newer operation on the resource ends it.
       if (isAsyncIterable(result)) {
+        if (runtime.fetchId !== currentFetchId || !isActive()) {
+          return result
+        }
         // Mark as queried so refetch() works during streaming
         entry.hasQueried = true
 
@@ -838,6 +967,14 @@ export function createResourceAccessor(
         return lastYield
       }
 
+      // The key stopped being active while the request ran: the result still lands in its own
+      // entry so a hidden page, or the page shown again, reads it instead of staying pending.
+      // Lifecycle adapters persist through the active view, so they only see active results.
+      if (!isActive()) {
+        settleEntry(entry, result, descriptor.kind === 'infinite' && mode === 'append')
+        return result
+      }
+
       // Non-streaming path (original behavior)
       if (descriptor.kind === 'single' || descriptor.kind === 'realtime') {
         applyRemoteResult(result, false, requestTokens)
@@ -874,7 +1011,11 @@ export function createResourceAccessor(
 
       return result
     } catch (error) {
-      if (runtime.fetchId !== currentFetchId) {
+      if (!isCurrent()) {
+        throw error
+      }
+      if (!isActive()) {
+        settleEntryError(entry, error)
         throw error
       }
       runtime.slowLoading?.reset()
@@ -897,7 +1038,7 @@ export function createResourceAccessor(
       scheduleRefetchInterval()
       throw error
     } finally {
-      if (runtime.fetchId === currentFetchId) {
+      if (isCurrent() && isActive()) {
         runtime.slowLoading?.reset()
         state.isLoading = false
         state.isFetching = false
@@ -926,12 +1067,10 @@ export function createResourceAccessor(
    * keep waiting for `commitSuspend`, so an abandoned transition never replaces the current screen.
    */
   const activateStagedEntry = (entry: QueryCacheEntry, key: QueryCacheKey, queryArg: unknown) => {
-    runtime.slowLoading?.reset()
     runtime.fetchId++
-    runtime.lastArg = queryArg
-    runtime.activeKey = key
-    activateLifecycle(key, queryArg)
-    runInternal(() => applyCachedState(state, entry))
+    entry.fetchSeq++
+    // Render-time: mirror only; the owner's commit clears `stagedKey` and confirms followers.
+    activate(key, queryArg, { commit: false })
   }
 
   /**
@@ -1193,10 +1332,16 @@ export function createResourceAccessor(
   ): Promise<unknown> => {
     const queryArg = hasArg ? arg : undefined
     const entry = runtime.cacheEntries.get(key)
+    // Decided against the previous active key, so read it before this key takes over.
+    const placeholder = entry?.hasQueried ? undefined : readSuspendPlaceholder(key)
+    // The owner confirms its key in the layout phase whatever the entry holds, so followers that
+    // pinned the staged key settle before paint even when the request is gated or still pending.
+    activate(key, queryArg)
+
     if (!entry?.hasQueried) {
       // A seeded key upgrades now; a key kept behind placeholder data loads now. Both keep the
       // painted value visible.
-      return seeded || readSuspendPlaceholder(key)
+      return seeded || placeholder
         ? executeQuery(queryArg, undefined, hasArg, 'replace', false)
         : Promise.resolve()
     }
@@ -1209,15 +1354,7 @@ export function createResourceAccessor(
 
     runtime.slowLoading?.reset()
     runtime.fetchId++
-    runtime.lastArg = queryArg
-    runtime.activeKey = key
-    activateLifecycle(key, queryArg)
-
-    const gcTimer = runtime.gcTimers.get(key)
-    if (gcTimer !== undefined) {
-      clearTimeout(gcTimer)
-      runtime.gcTimers.delete(key)
-    }
+    entry.fetchSeq++
 
     if (lifecycleBindings.length > 0) {
       // Durable restoration is intentionally skipped during render. Once the
@@ -1344,19 +1481,11 @@ export function createResourceAccessor(
     const key = serializeResourceArg(descriptor, setArg)
 
     // A server initializer must win over an IndexedDB restore or request that
-    // started before it. Advancing fetchId invalidates either pending result.
+    // started before it. Advancing the generations invalidates either pending result.
     runtime.slowLoading?.reset()
     runtime.fetchId++
-    runtime.lastArg = setArg
-    runtime.activeKey = key
-    activateLifecycle(key, setArg)
-
-    let entry = runtime.cacheEntries.get(key)
-    if (!entry) {
-      entry = createCacheEntry(state, key, setArg)
-      runtime.cacheEntries.set(key, entry)
-    }
-    entry.arg = setArg
+    const entry = activate(key, setArg) as QueryCacheEntry
+    entry.fetchSeq++
 
     const stateKeys = new Set([
       'data',
@@ -1473,9 +1602,11 @@ export function createResourceAccessor(
 
     runtime.slowLoading?.reset()
     runtime.fetchId++
-    runtime.lastArg = queryArg
-    runtime.activeKey = key
-    activateLifecycle(key, queryArg)
+    entry.fetchSeq++
+    // Observed entries confirm after commit; a render-time initialization only mirrors. The
+    // hydrated entry is installed afterwards: a lifecycle adapter may clear the cache during
+    // activation (a `local` scope change), and the server value must survive that.
+    activate(key, queryArg, { commit: phase === 'commit' })
     runtime.cacheEntries.set(key, entry)
     runInternal(() => Object.assign(state, structuredClone(nextState)))
 
@@ -1494,6 +1625,7 @@ export function createResourceAccessor(
   const baseBound = new Proxy(state, {
     get(target, prop) {
       if (prop === RESOURCE_HYDRATE) return hydrateResource
+      if (prop === RESOURCE_ACTIVATE) return activateOwner
       if (prop === RESOURCE_SUSPEND_PREPARE) return prepareSuspend
       if (prop === RESOURCE_SUSPEND_COMMIT) return commitSuspend
       if (prop === RESOURCE_SUSPEND_RESTORE) return restoreSuspend

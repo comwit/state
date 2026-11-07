@@ -10,6 +10,7 @@ export const RESOURCE_SUSPEND_RESTORE = Symbol('comwit-resource-suspend-restore'
 export const RESOURCE_SUSPEND_STREAM = Symbol('comwit-resource-suspend-stream')
 export const RESOURCE_SUSPEND_PLACEHOLDER = Symbol('comwit-resource-suspend-placeholder')
 export const RESOURCE_HYDRATE = Symbol('comwit-resource-hydrate')
+export const RESOURCE_ACTIVATE = Symbol('comwit-resource-activate')
 /**
  * Marks a descriptor whose selectors expose `.load()` but not `.suspend()`. `local()` sets it:
  * suspending on a durable resource would skip its IndexedDB restore, so the selector throws.
@@ -551,6 +552,12 @@ export type QueryCacheEntry = {
   lastResult?: unknown
   cursorHistory: Array<string | null>
   state: ResourceDataLike
+  /**
+   * Generation of the latest request or write for this key. A settling fetch lands in its entry
+   * only while it is still the newest; a newer fetch, `.set()` or hydration for the same key
+   * discards it. Unlike the runtime-wide `fetchId`, another key's request never discards it.
+   */
+  fetchSeq: number
   /** Real query promise staged by selector `.suspend()` before the resource is observable. */
   suspendPromise?: Promise<unknown>
   /** Rejection retained for an ErrorBoundary on the next render retry. */
@@ -600,10 +607,48 @@ export type QueryBindingRegistry = {
   suspendStream?: SuspendStream
 }
 
+/** Hears every committed activation of a query runtime; `undefined` when gc reset the active key. */
+export type QueryActivationListener = (key: QueryCacheKey | undefined) => void
+
+/**
+ * One component's pinned key for a query runtime. Argument-less reads in that component resolve
+ * through the pin instead of the runtime-wide `activeKey`, so a page kept alive in a hidden
+ * `<Activity>` keeps rendering its own item.
+ */
+export type QueryFollowerPin = {
+  key: QueryCacheKey | undefined
+  /** Whether a committed activation (or the passive fallback) has settled this pin. */
+  confirmed: boolean
+}
+
+export type QueryFollowerPins = Map<ResourceRuntimeState, QueryFollowerPin>
+
+export type QueryActivateOptions = {
+  /** Clear `stagedKey` and notify listeners. Render-time activations leave both for the commit. */
+  commit?: boolean
+  /** Call-level placeholder override used when mirroring an unqueried entry. */
+  placeholderData?: PlaceholderData<unknown, unknown>
+}
+
 export type ResourceRuntimeState = {
   path: string
   lastArg?: unknown
+  /** Key mirrored in the model field. Written only by the accessor's `activate()`. */
   activeKey?: QueryCacheKey
+  /**
+   * Key an owner (`load(key)` / `suspend(key)` in a selector) rendered with before its commit.
+   * Render-only: followers rendered after the owner pin it; it never touches the model field.
+   */
+  stagedKey?: QueryCacheKey
+  /** Followers currently subscribed from their layout effect. */
+  listeners: Set<QueryActivationListener>
+  /**
+   * Weak references to the pin maps of components that read this runtime as a follower. A key
+   * that any live holder still pins is retained from gc, so a hidden page keeps its entry.
+   */
+  pinHolders: Set<WeakRef<QueryFollowerPins>>
+  /** The accessor's `activate()`; lets the gc scheduler reset the active key through it. */
+  activate?: (key: QueryCacheKey | undefined, arg: unknown, options?: QueryActivateOptions) => void
   fetchId: number
   slowLoading?: import('./slow-loading').SlowLoadingClock
   cacheEntries: Map<QueryCacheKey, QueryCacheEntry>

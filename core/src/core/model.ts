@@ -4,6 +4,7 @@ import {
   useId,
   useLayoutEffect,
   useMemo,
+  useReducer,
   useRef,
   useSyncExternalStore,
 } from 'react'
@@ -31,20 +32,26 @@ import {
 import { bindResourceState } from './query/bind'
 import { hydrateQueryResources } from './query/hydrate'
 import {
+  activateQuerySelectorOwners,
   commitQuerySelectorSuspenseLoads,
+  createQueryFollowContext,
   createQuerySelectorState,
   prepareQuerySelectorSuspense,
   querySelectorLoadKey,
   recordQuerySelectorSuspense,
   runQuerySelectorLoads,
+  type QueryFollowContext,
   type QuerySelectorLoad,
 } from './query/select'
 import { QUERY_PLUGIN_NAME } from './query/plugin'
 import type {
+  QueryActivationListener,
   QueryBindingRegistry,
+  QueryCacheKey,
   QueryDefaultOptions,
   QueryHydrationEntries,
   ResourceDescriptorMap,
+  ResourceRuntimeState,
   SelectableResourceState,
 } from './query/types'
 
@@ -364,6 +371,13 @@ export function useModel<T extends object, R>(
   const selectorRef = useRef(selector)
   selectorRef.current = selector
   const queryLoadsRef = useRef<QuerySelectorLoad[]>([])
+  // Per-component pins for argument-less query reads, and the keys this component's owners
+  // confirmed. They outlive a hidden <Activity> (effects are torn down, refs are not).
+  const followRef = useRef<QueryFollowContext | null>(null)
+  if (followRef.current === null) followRef.current = createQueryFollowContext()
+  const follow = followRef.current
+  const followedRef = useRef<ResourceRuntimeState[]>([])
+  const [, rerender] = useReducer((count: number) => count + 1, 0)
 
   const lifecycle = registry.getLifecycle(m)
 
@@ -398,6 +412,7 @@ export function useModel<T extends object, R>(
       const readRaw = () =>
         server && store.getServerSnapshot ? store.getServerSnapshot() : store.getSnapshot()
       const select = (raw: T, loads: QuerySelectorLoad[], mayInitialize: boolean) => {
+        follow.followed = new Set()
         const selectable =
           queryBag?.size && queryRegistry
             ? createQuerySelectorState(
@@ -407,7 +422,8 @@ export function useModel<T extends object, R>(
                 queryRegistry,
                 loads,
                 hookId,
-                mayInitialize
+                mayInitialize,
+                follow
               )
             : raw
         return selectorRef.current
@@ -415,32 +431,40 @@ export function useModel<T extends object, R>(
           : selectable
       }
 
-      // Like useHydrateModel: a model nobody has read yet may be initialized before its first
-      // snapshot. The selector learns which streamed `.suspend()` keys apply, so it runs first.
-      const mayInitialize = !store.hasReadSnapshot()
-      let loads: QuerySelectorLoad[] = []
-      let next = select(readRaw(), loads, mayInitialize)
-      if (loads.some((load) => load.initialized)) {
-        // The restored result is already in the proxy; re-read so passive fields of this same
-        // selector observe it in the hydrating render.
-        store.refreshServerSnapshot?.()
-        loads = []
-        next = select(readRaw(), loads, false)
-      }
-      queryLoadsRef.current = loads
+      // Argument-less reads may pin a key only while this selector runs (the equality check
+      // below walks the same proxies). Reads outside a selector resolve without pinning.
+      follow.collecting = true
+      try {
+        // Like useHydrateModel: a model nobody has read yet may be initialized before its first
+        // snapshot. The selector learns which streamed `.suspend()` keys apply, so it runs first.
+        const mayInitialize = !store.hasReadSnapshot()
+        let loads: QuerySelectorLoad[] = []
+        let next = select(readRaw(), loads, mayInitialize)
+        if (loads.some((load) => load.initialized)) {
+          // The restored result is already in the proxy; re-read so passive fields of this same
+          // selector observe it in the hydrating render.
+          store.refreshServerSnapshot?.()
+          loads = []
+          next = select(readRaw(), loads, false)
+        }
+        queryLoadsRef.current = loads
+        followedRef.current = [...follow.followed]
 
-      if (
-        prevRef.current !== null &&
-        isEqual(prevRef.current, next) &&
-        sameSearchParamAccess(prevRef.current, next)
-      ) {
-        return prevRef.current as R
-      }
+        if (
+          prevRef.current !== null &&
+          isEqual(prevRef.current, next) &&
+          sameSearchParamAccess(prevRef.current, next)
+        ) {
+          return prevRef.current as R
+        }
 
-      prevRef.current = next
-      return next as R
+        prevRef.current = next
+        return next as R
+      } finally {
+        follow.collecting = false
+      }
     },
-    [hookId, queryBag, queryController, queryRegistry, store]
+    [follow, hookId, queryBag, queryController, queryRegistry, store]
   )
 
   const getSnapshot = useCallback(() => readSelectedSnapshot(false), [readSelectedSnapshot])
@@ -450,11 +474,63 @@ export function useModel<T extends object, R>(
   useCommitEffect(() => registry.observe(m), [registry, m])
   const queryLoads = queryLoadsRef.current
   const selectorLoadKey = querySelectorLoadKey(queryLoads)
+  const followed = followedRef.current
+  const followedKey = followed
+    .map((runtime) => runtime.path)
+    .sort()
+    .join('\u0000')
+
+  // Followers hear confirms while visible. Layout effects run child-first, so a follower below
+  // its owner is subscribed before the owner confirms and re-pins before paint; hiding a page
+  // removes these listeners in the mutation phase, before the shown page's owner confirms.
+  // Declared before the owner effect so a component that owns and follows the same runtime
+  // hears its own confirm.
+  useCommitEffect(() => {
+    if (followed.length === 0) return
+    const offs = followed.map((runtime) => {
+      const listener: QueryActivationListener = (key) => {
+        const pin = follow.pins.get(runtime)
+        const changed = pin?.key !== key
+        if (pin) {
+          pin.key = key
+          pin.confirmed = true
+        } else {
+          follow.pins.set(runtime, { key, confirmed: true })
+        }
+        if (changed) rerender()
+      }
+      runtime.listeners.add(listener)
+      return () => runtime.listeners.delete(listener)
+    })
+    return () => offs.forEach((off) => off())
+  }, [followedKey])
 
   useCommitEffect(() => {
     if (!queryRegistry || queryLoads.length === 0) return
+    // `load(key)` owners confirm here, ahead of their passive fetch; `suspend(key)` owners
+    // confirm inside commitSuspend.
+    activateQuerySelectorOwners(queryLoads)
     commitQuerySelectorSuspenseLoads(queryLoads, queryRegistry)
+    for (const load of queryLoads) {
+      if (!load.owner) continue
+      const runtime = queryRegistry.boundResourceRuntime.get(load.controller)
+      if (runtime) follow.owned.set(runtime, load.key as QueryCacheKey)
+    }
   }, [queryRegistry, selectorLoadKey])
+
+  // Pins that missed the confirm (owner is an earlier sibling, or this follower mounted in a
+  // later commit) settle on the committed key. Confirmed pins are never overwritten: a page shown
+  // again keeps its key until its own owner re-confirms.
+  useEffect(() => {
+    for (const runtime of followed) {
+      const pin = follow.pins.get(runtime)
+      if (!pin || pin.confirmed) continue
+      const changed = pin.key !== runtime.activeKey
+      pin.key = runtime.activeKey
+      pin.confirmed = true
+      if (changed) rerender()
+    }
+  }, [followedKey])
 
   useEffect(() => {
     if (!queryRegistry || queryLoads.length === 0) return
