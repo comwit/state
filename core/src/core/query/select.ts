@@ -154,8 +154,9 @@ function cachedState(
   }
 
   // The key's own partial value beats another key's placeholder. It is read from the model
-  // snapshot this selector renders from, so the seed cannot write to the store during render.
-  const seed = readResourceSeed(descriptor, arg, root)
+  // snapshot this selector renders from, so the seed cannot write to the store during render;
+  // `read(other)` peeks other models' snapshots the same way, without creating or observing them.
+  const seed = readResourceSeed(descriptor, arg, root, registry)
   if (seed !== undefined) {
     load.seeded = true
     return seededState(descriptor, seed)

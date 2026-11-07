@@ -3,6 +3,7 @@ export type {
   PlaceholderData,
   QuerySeed,
   QuerySeedContext,
+  QuerySeedRead,
   QuerySeedShape,
   SeededData,
   SeededSingleResourceState,

@@ -23,6 +23,7 @@ export type {
   QueryHydrationEntries,
   QuerySeed,
   QuerySeedContext,
+  QuerySeedRead,
   SeededData,
   SeededSingleResourceState,
   SelectableResourceState,

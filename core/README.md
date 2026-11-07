@@ -189,6 +189,8 @@ Rules:
 
 - `seed` runs during render, so it must be pure: read `state` (the model's own state, a read-only
   snapshot), never write. Return `null`/`undefined` when the model holds nothing for the key.
+  `state` is typed `any` because `query()` is declared before its model exists; annotate the
+  context parameter with `QuerySeedContext<CatalogState>` to type it.
 - `TSeed` may only name fields of the full value, with the same types; extra keys are a type error.
 - With a seed, `.suspend(id)` does not suspend and `.load(id)` does not report `isLoading`; both
   paint the seed and start the upgrade after commit. With neither seed nor cache, `.suspend(id)`
@@ -201,6 +203,24 @@ Rules:
   not-found.
 - Seeds are per key. Changing the argument never shows another key's seed, and several mounted
   readers each paint their own key.
+
+Reading another model (experimental): the seed context also offers `read(model)` for a seed whose
+source lives in another domain's model:
+
+```ts
+seed: (slug, { state, read }) =>
+  state.list.data.find((p) => p.slug === slug) ??
+  read(lounge)?.overview.data?.blogs.find((b) => b.slug === slug)
+```
+
+The recommended design keeps one model per resource (a page that needs several resources calls
+each resource's hook), so a detail's seed source normally lives in its own model and `state` is
+enough. `read` runs at render time and never initializes, mounts or observes the model it is
+given: until something else has registered that model in the provider it returns `undefined` and
+the key loads or suspends normally. It returns the same read-only snapshot `state` is (no
+`.load()`, no fetch, writes throw). Seeds are not subscribed to it: they are evaluated from the
+current snapshots when the key is read, so a later change to the other model does not re-seed a
+key that already painted.
 
 `seed` differs from `placeholderData`: a placeholder keeps *another key's* full result visible
 while a new key loads; a seed is the *same key's* partial value. Infinite, realtime and

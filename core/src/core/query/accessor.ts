@@ -21,6 +21,7 @@ import {
   type QueryDefaultOptions,
   type QueryMode,
   type QuerySeed,
+  type QuerySeedRead,
   type RealtimeResourceDescriptor,
   type ResourceBaseState,
   type ResourceContext,
@@ -106,19 +107,27 @@ function contextFor<TState>(state: TState) {
 
 /**
  * Evaluate a single query's declared `seed` for one key against the owning model's state.
- * Returns `undefined` when the descriptor has no seed, the model holds nothing for the key, or
- * the resource is a kind that never seeds (infinite, realtime, `local()`).
+ * Returns `undefined` when the descriptor has no seed or the model holds nothing for the key.
+ * Only `query()` and `local.query()` declare one; infinite, realtime and standalone `local()`
+ * resources never carry a `seed`.
+ *
+ * `read(other)` hands the seed another model's current snapshot through
+ * `registry.peekModelSnapshot`, which the provider binds to its store map: it never creates,
+ * observes or marks that model as read, so a model nothing has registered yet reads as
+ * `undefined` and the key loads normally. The snapshot is the plain frozen state, not a bound
+ * controller or selector, so it exposes no `.load()`/`.query()` and rejects writes.
  */
 export function readResourceSeed(
   descriptor: AnyResourceDescriptor,
   arg: unknown,
-  modelState: object | undefined
+  modelState: object | undefined,
+  registry: QueryBindingRegistry
 ): unknown {
-  if (descriptor.kind !== 'single' || descriptor.selectorMethod !== undefined) return undefined
-  if ((descriptor[RESOURCE_LIFECYCLE]?.length ?? 0) > 0) return undefined
+  if (descriptor.kind !== 'single') return undefined
   const seed = (descriptor as { seed?: QuerySeed<unknown, unknown> }).seed
   if (typeof seed !== 'function' || modelState === undefined) return undefined
-  return seed(arg, { state: modelState }) ?? undefined
+  const read = ((model: object) => registry.peekModelSnapshot?.(model)) as QuerySeedRead
+  return seed(arg, { state: modelState, read }) ?? undefined
 }
 
 /**
@@ -418,7 +427,7 @@ export function createResourceAccessor(
   /** The key's seed as a detached, writable value, or `undefined` when the model has none. */
   const readSeed = (arg: unknown): unknown => {
     if (!tracksPartial) return undefined
-    const seed = readResourceSeed(descriptor, arg, modelState)
+    const seed = readResourceSeed(descriptor, arg, modelState, registry)
     return seed === undefined ? undefined : materializeSeed(seed)
   }
 

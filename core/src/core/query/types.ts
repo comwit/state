@@ -1,3 +1,4 @@
+import type { Model } from '../model'
 import type { SuspendStream } from './stream'
 
 export const RESOURCE_BRAND = Symbol('comwit-resource')
@@ -26,12 +27,28 @@ type ResourceResultShape<
 export type PlaceholderData<TData, TArg = void> =
   TData | ((arg: TArg, previousData: TData) => TData)
 
-export type QuerySeedContext = {
+/**
+ * Reads another model's current snapshot from inside a `seed`.
+ *
+ * @experimental The recommended design keeps one model per resource, so a detail's seed source
+ * normally lives in the same model as the detail; prefer `state` where that holds. `read` never
+ * initializes, mounts or observes the model it is given: it returns `undefined` until something
+ * else has registered that model in the provider. The value is the same read-only snapshot the
+ * owning model's `state` is during render: no `.load()`, no fetch, no writes. Seeds are not
+ * subscribed to it; they are evaluated from current snapshots when the key is read.
+ */
+export type QuerySeedRead = <T extends object>(model: Model<T>) => Readonly<T> | undefined
+
+export type QuerySeedContext<TState = any> = {
   /**
    * The owning model's current state, read the way `computed()` reads it. During render this is
-   * the read-only snapshot the selector renders from; never write to it.
+   * the read-only snapshot the selector renders from; never write to it. `query()` is declared
+   * before its model exists, so the default is `any`; annotate the context parameter with
+   * `QuerySeedContext<OwnState>` to type it.
    */
-  state: any
+  state: TState
+  /** @experimental Another model's current snapshot, or `undefined` while it is not registered. */
+  read: QuerySeedRead
 }
 
 /**
@@ -551,6 +568,11 @@ export type QueryBindingRegistry = {
   services: Map<symbol, unknown>
   /** Lazily resolves another model from the same provider. */
   getModelState?: (model: object) => object
+  /**
+   * Another model's current snapshot, or `undefined` while the provider has not created it.
+   * Never creates, observes or marks the model as read; `seed` reads other models through it.
+   */
+  peekModelSnapshot?: (model: object) => object | undefined
   /** Provider transport carrying server-resolved `.suspend()` results into the browser cache. */
   suspendStream?: SuspendStream
 }

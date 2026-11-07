@@ -32,7 +32,9 @@ export function createSingleDescriptor<TData, TArg = void, TSeed = never>(
     ...optionValues
   } = opts as SingleResourceBuilderOptions<TData, TArg, unknown>
   if (seed !== undefined && typeof seed !== 'function') {
-    throw new TypeError('query() seed must be a function: (arg, { state }) => partial | null')
+    throw new TypeError(
+      'query() seed must be a function: (arg, { state, read }) => partial | null'
+    )
   }
 
   const initialState: ResourceSingleState<TData> = {

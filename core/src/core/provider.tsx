@@ -58,6 +58,8 @@ export type LifecycleState = {
 
 export type StoreRegistry = {
   get<T extends object>(model: Model<T>): StoreEntry<T>
+  /** The model's store if this provider has created it; never creates or observes one. */
+  peek<T extends object>(model: Model<T>): StoreEntry<T> | undefined
   getLifecycle(model: Model<any>): LifecycleState
   observe(model: Model<any>): () => void
   dispose(): void
@@ -166,6 +168,9 @@ export function ComwitProvider({
           getDevTools()?.registerStore(model, entry)
         return entry
       },
+      peek<T extends object>(model: Model<T>): StoreEntry<T> | undefined {
+        return stores.get(model.key) as StoreEntry<T> | undefined
+      },
       getLifecycle(model) {
         const existing = lifecycles.get(model.key)
         if (existing) return existing
@@ -204,6 +209,9 @@ export function ComwitProvider({
     const queryRegistry = pluginStates.get('query') as QueryBindingRegistry | undefined
     if (queryRegistry) {
       queryRegistry.getModelState = (source) => registry.get(source as Model<object>).proxy
+      // Seeds peek at other models without creating them: an unregistered model reads as undefined.
+      queryRegistry.peekModelSnapshot = (source) =>
+        registry.peek(source as Model<object>)?.peekSnapshot()
       if (insertServerHTML) {
         queryRegistry.suspendStream = createSuspendStream(reactId, typeof window === 'undefined')
       }

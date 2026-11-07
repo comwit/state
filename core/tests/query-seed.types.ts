@@ -1,4 +1,13 @@
-import { action, create, model, query, type Query, type SeededSingleResourceState } from '../src'
+import {
+  action,
+  create,
+  model,
+  query,
+  type Query,
+  type QuerySeedContext,
+  type QuerySeedRead,
+  type SeededSingleResourceState,
+} from '../src'
 import type { BoundResourceState, SelectableResourceState } from '../src/core/query/types'
 
 type Summary = { id: string; title: string }
@@ -158,5 +167,50 @@ function hydrationContract() {
   // @ts-expect-error hydration data is the full value, not the seed
   useCatalog.hydrate({ detail: { arg: 'a', data: { id: 'a', title: 'A' } } })
 }
+
+// The own-model `state` defaults to any; the context parameter may be annotated to type it.
+type CatalogState = { list: Query<Summary[]>; detail: Query<Detail | null, string, Summary> }
+const typedState = query<Detail | null, string, Summary>({
+  initialData: null,
+  queryFn: findDetail,
+  seed: (id, { state }: QuerySeedContext<CatalogState>) => {
+    const items: Summary[] = state.list.data
+    // @ts-expect-error a typed context only knows the owning model's fields
+    state.nope
+    // @ts-expect-error the snapshot has no selector methods
+    state.list.load
+    return items.find((item) => item.id === id)
+  },
+})
+void typedState
+
+// Reading another model (experimental): typed snapshot, undefined until registered, read-only.
+const lounge = model({
+  overview: query<{ blogs: Summary[] } | null>({ initialData: null, queryFn: async () => null }),
+  count: 0,
+})
+const crossDetail = query<Detail | null, string, Summary>({
+  initialData: null,
+  queryFn: findDetail,
+  seed: (id, { state, read }) => {
+    const reader: QuerySeedRead = read
+    const other = read(lounge)
+    const count: number | undefined = other?.count
+    const blogs: Summary[] | undefined = other?.overview.data?.blogs
+    // @ts-expect-error read() is undefined until the model is registered
+    read(lounge).overview
+    // @ts-expect-error the snapshot has no selector methods
+    other?.overview.load
+    // @ts-expect-error the snapshot has no controller methods
+    other?.overview.query
+    // @ts-expect-error the snapshot is read-only
+    if (other) other.count = 1
+    // @ts-expect-error read() takes a model, not arbitrary state
+    read({ count: 0 })
+    void [reader, count]
+    return state.list.data.find((item: Summary) => item.id === id) ?? blogs?.find((b) => b.id === id)
+  },
+})
+void crossDetail
 
 void [selectorContract, hydrationContract]
