@@ -3,7 +3,7 @@ import React, { type ReactNode } from 'react'
 import { IDBFactory } from 'fake-indexeddb'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { ComwitProvider, create, local, model, query, useModel } from '../src'
+import { action, ComwitProvider, create, local, model, query, useModel } from '../src'
 import { bindResourceState, createQueryBindingRegistry } from '../src/core/query'
 
 type Summary = { id: string; title: string }
@@ -97,7 +97,15 @@ function setup(options: {
       seed,
     }),
   })
-  const useCatalog = create(catalog, { actions: [] })
+  const editActions = action<{ rename(title: string): void }>(({ state }) => {
+    const m = state(catalog)
+    return {
+      rename(title) {
+        if (m.detail.data) m.detail.data.title = title
+      },
+    }
+  })
+  const useCatalog = create(catalog, { actions: [editActions] })
 
   /** Every rendered state, in order (one entry per render). */
   const frames: string[] = []
@@ -112,7 +120,13 @@ function setup(options: {
       `success:${String(detail.isSuccess)}`,
     ].join('|')
     frames.push(frame)
-    return <div data-testid="frame">{frame}</div>
+    const actions = useCatalog((state) => state.actions)
+    return (
+      <>
+        <div data-testid="frame">{frame}</div>
+        <button onClick={() => actions.rename('Edited')}>rename</button>
+      </>
+    )
   }
   function Provider({ children }: { children: ReactNode }) {
     return (
@@ -240,6 +254,36 @@ describe('local.query() seed', () => {
     expect(frames.slice(before).every((f) => f === STORED_FRESH_FRAME)).toBe(true)
     expect(seed).not.toHaveBeenCalled()
     expect(queryFn).not.toHaveBeenCalled()
+  })
+
+  test('an edit while the key is partial is not persisted as the key\'s full view', async () => {
+    const factory = new IDBFactory()
+    const database = `seed-local-edit-${crypto.randomUUID()}`
+    const first = setup({ factory, database })
+
+    const view = await renderAsync(
+      <first.Provider>
+        <first.Detail id="a" />
+      </first.Provider>
+    )
+    await waitFor(() => expect(first.queryFn).toHaveBeenCalledOnce())
+    await act(async () => {
+      fireEvent.click(screen.getByText('rename'))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    expect(frame()).toContain('Edited|bones|partial:true')
+    view.unmount()
+
+    // A later session must not restore the edited seed as a full value.
+    const later = setup({ factory, database, staleTime: 60_000 })
+    await renderAsync(
+      <later.Provider>
+        <later.Detail id="a" />
+      </later.Provider>
+    )
+    await waitFor(() => expect(later.queryFn).toHaveBeenCalledOnce())
+    expect(later.frames.some((f) => f.includes('partial:false'))).toBe(false)
+    expect(frame()).toBe(SEED_FRAME)
   })
 
   test('the accessor paints the seed synchronously before the durable read', async () => {

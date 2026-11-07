@@ -1548,6 +1548,8 @@ export class LocalResourceBinding {
       return
     }
     if (!this.activeView) return
+    // A seed is not the key's value: edits to it stay in memory until the upgrade lands.
+    if ((this.state as { isPartial?: boolean }).isPartial === true) return
     for (const id of idsFromOp(op, this.state, this.metadata)) this.dirtyIds.add(id)
     if (this.pendingMutation) return
     this.pendingMutation = true
