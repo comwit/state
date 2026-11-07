@@ -4,11 +4,14 @@ import type {
   PlaceholderData,
   QueryBindingRegistry,
   QueryCacheKey,
+  QueryFollowerPin,
+  QueryFollowerPins,
   ResourceDataLike,
   ResourceDescriptorMap,
   ResourceRuntimeState,
 } from './types'
 import {
+  RESOURCE_ACTIVATE,
   RESOURCE_LOAD_ONLY,
   RESOURCE_SUSPEND_COMMIT,
   RESOURCE_SUSPEND_PLACEHOLDER,
@@ -28,10 +31,88 @@ export type QuerySelectorLoad = {
   path: string
   method: string
   mode: 'load' | 'suspend'
+  /**
+   * Whether this call chooses the key: `load(key)` / `suspend(key)` with an argument, or an
+   * argument-less call while the runtime has no active key yet. An argument-less `load()` with a
+   * current key only follows it.
+   */
+  owner: boolean
+  /**
+   * Set by the owner's layout effect when it re-runs with an unchanged key (a kept-alive page
+   * shown again, StrictMode): the key this component's pin witnessed last, where a confirm from
+   * elsewhere (an action, a child owner) moved the page while it was visible. Activation, the
+   * suspend commit and the fetch act on it; `key` stays the render key for `owned` and the
+   * effect deps.
+   */
+  resume?: { key: QueryCacheKey; arg: unknown }
   /** A streamed `.suspend()` result initialized this never-read model during the selector. */
   initialized?: boolean
   /** The selector painted this key's seed; it upgrades after commit instead of suspending. */
   seeded?: boolean
+}
+
+/**
+ * What `cachedState` resolves: an owner's selector load, or a follower's view of its pinned key
+ * (`mode: 'follow'`), which reads like a `.suspend()` key but is never collected as a load.
+ */
+type QuerySelectorView = Pick<QuerySelectorLoad, 'key' | 'arg' | 'seeded'> & {
+  mode: QuerySelectorLoad['mode'] | 'follow'
+}
+
+/**
+ * One `useModel()` instance's view of the query runtimes it reads. Argument-less reads resolve
+ * through `pins` instead of the runtime-wide `activeKey`; owners record the key they confirmed.
+ */
+export type QueryFollowContext = {
+  /** Pinned key per runtime for this component's argument-less reads. */
+  pins: QueryFollowerPins
+  /** Weak handle registered on runtimes so pinned entries survive gc while the component lives. */
+  holder: WeakRef<QueryFollowerPins>
+  /** Key each owner call in this component last confirmed, per runtime. */
+  owned: Map<ResourceRuntimeState, QueryCacheKey>
+  /** Runtimes read as a follower during the latest selector run. */
+  followed: Set<ResourceRuntimeState>
+  /** True while a selector runs: only then do argument-less reads create pins. */
+  collecting: boolean
+}
+
+export function createQueryFollowContext(): QueryFollowContext {
+  const pins: QueryFollowerPins = new Map()
+  const holder =
+    typeof WeakRef === 'function'
+      ? new WeakRef(pins)
+      : ({ deref: () => pins } as unknown as WeakRef<QueryFollowerPins>)
+  return { pins, holder, owned: new Map(), followed: new Set(), collecting: false }
+}
+
+/**
+ * This component's pin for a runtime. A first pin takes the key an owner above has just staged
+ * in this render, else the active key, so the first render already shows the owner's item; it
+ * is confirmed from the owner's commit or the passive fallback.
+ */
+function followerPin(
+  follow: QueryFollowContext,
+  runtime: ResourceRuntimeState
+): QueryFollowerPin | undefined {
+  let pin = follow.pins.get(runtime)
+  if (!pin) {
+    if (!follow.collecting) return undefined
+    pin = { key: runtime.stagedKey ?? runtime.activeKey, confirmed: false }
+    follow.pins.set(runtime, pin)
+    runtime.pinHolders.add(follow.holder)
+  }
+  if (follow.collecting) follow.followed.add(runtime)
+  return pin
+}
+
+/**
+ * The argument behind a key a follower reads: from its entry, else from the owner that staged
+ * it in this render (its entry exists only once that owner activates in the layout phase).
+ */
+function keyArg(runtime: ResourceRuntimeState, key: QueryCacheKey): unknown {
+  const entry = runtime.cacheEntries.get(key)
+  if (entry) return entry.arg
+  return runtime.stagedKey === key ? runtime.stagedArg : undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -122,7 +203,7 @@ function cachedState(
   controller: ResourceDataLike,
   descriptor: AnyResourceDescriptor,
   registry: QueryBindingRegistry,
-  load: QuerySelectorLoad
+  load: QuerySelectorView
 ): ResourceDataLike {
   const { key, arg, mode } = load
   const activeEntry = runtime?.activeKey === key ? runtime.cacheEntries.get(key) : undefined
@@ -164,7 +245,9 @@ function cachedState(
     return seededState(descriptor, seed)
   }
 
-  if (mode === 'suspend') {
+  // A `.suspend()` key, or a follower pinned to one, keeps the previous result through
+  // `placeholderData` until the key loads after commit.
+  if (mode !== 'load') {
     const placeholder = placeholderState(state, controller, key, arg)
     if (placeholder) return placeholder
   }
@@ -181,10 +264,31 @@ function createResourceSelector(
   registry: QueryBindingRegistry,
   loads: QuerySelectorLoad[],
   hookId: string | undefined,
-  mayInitialize: boolean
+  mayInitialize: boolean,
+  follow: QueryFollowContext | undefined
 ) {
+  const runtime = registry.boundResourceRuntime.get(controller)
+  // Pin at field access: a selector may return the field itself and the component reads `.data`
+  // from it after the selector ran, so the pin and the follower subscription must exist by then.
+  if (runtime && follow) followerPin(follow, runtime)
+
+  /**
+   * What an argument-less read sees: the live model field while this component's pin is the
+   * active, committed key; otherwise its pinned entry through `cachedState`'s branches.
+   */
+  const followerView = (): ResourceDataLike => {
+    if (!runtime || !follow) return state
+    const key = followerPin(follow, runtime)?.key
+    if (key === undefined) return state
+    return cachedState(state, root, runtime, controller, descriptor, registry, {
+      key,
+      arg: keyArg(runtime, key),
+      mode: 'follow',
+    })
+  }
+
   return new Proxy(state, {
-    get(target, prop, receiver) {
+    get(target, prop) {
       if (
         prop === 'suspend' &&
         (descriptor as Partial<LoadOnlyResource>)[RESOURCE_LOAD_ONLY] === true
@@ -199,12 +303,50 @@ function createResourceSelector(
       const selectorMethod = descriptor.selectorMethod ?? 'load'
       const isSuspend =
         prop === 'suspend' && selectorMethod === 'load' && descriptor.kind !== 'realtime'
-      if (prop !== selectorMethod && !isSuspend) return Reflect.get(target, prop, receiver)
+      if (prop !== selectorMethod && !isSuspend) return Reflect.get(followerView(), prop)
 
       return (...args: unknown[]) => {
         const hasArg = args.length > 0
-        const arg = hasArg ? args[0] : undefined
-        const key = serializeResourceArg(descriptor, arg)
+        let arg = hasArg ? args[0] : undefined
+        let key = serializeResourceArg(descriptor, arg)
+        let owner = true
+
+        if (!hasArg && !isSuspend && runtime && follow) {
+          // `load()` without an argument loads the current key and never chooses one. It owns the
+          // `undefined` key only while nothing is active and nothing else is staged (its own stage
+          // of that key included, so the selector's repeated runs agree). Otherwise it follows:
+          // this component's pin, else the key an owner staged in this render, else the active
+          // key. A stale `stagedKey` left by a tree that never committed is cleared by the first
+          // follower that pins it (the passive fallback in useModel), which then takes ownership.
+          const owns =
+            runtime.activeKey === undefined &&
+            (runtime.stagedKey === undefined || runtime.stagedKey === key)
+          const current = owns
+            ? undefined
+            : (followerPin(follow, runtime)?.key ?? runtime.stagedKey ?? runtime.activeKey)
+          if (current !== undefined) {
+            key = current
+            arg = keyArg(runtime, current)
+            owner = false
+          }
+        }
+
+        if (owner && runtime && follow) {
+          // Stage on mount and whenever the key differs from the one this owner last confirmed.
+          // A hidden page re-rendering with an unchanged key leaves `stagedKey` alone, and so
+          // its own pin: that pin may hold a key a confirm from elsewhere (an action, a child
+          // owner) moved the page to while it was visible, which its layout effect resumes.
+          const pin = followerPin(follow, runtime)
+          if (follow.owned.get(runtime) !== key) {
+            runtime.stagedKey = key
+            runtime.stagedArg = arg
+            if (pin && pin.key !== key) {
+              pin.key = key
+              pin.confirmed = false
+            }
+          }
+        }
+
         const load: QuerySelectorLoad = {
           arg,
           controller,
@@ -213,6 +355,7 @@ function createResourceSelector(
           path,
           method: isSuspend ? 'suspend' : selectorMethod,
           mode: isSuspend ? 'suspend' : 'load',
+          owner,
         }
         loads.push(load)
 
@@ -228,7 +371,6 @@ function createResourceSelector(
           }
         }
 
-        const runtime = registry.boundResourceRuntime.get(controller)
         return cachedState(state, root, runtime, controller, descriptor, registry, load)
       }
     },
@@ -244,6 +386,7 @@ function bindSelectorPath(
   loads: QuerySelectorLoad[],
   hookId: string | undefined,
   mayInitialize: boolean,
+  follow: QueryFollowContext | undefined,
   path = ''
 ): object {
   return new Proxy(state, {
@@ -267,7 +410,8 @@ function bindSelectorPath(
           registry,
           loads,
           hookId,
-          mayInitialize
+          mayInitialize,
+          follow
         )
       }
 
@@ -283,6 +427,7 @@ function bindSelectorPath(
           loads,
           hookId,
           mayInitialize,
+          follow,
           nextPath
         )
       }
@@ -299,7 +444,8 @@ export function createQuerySelectorState<T extends object>(
   registry: QueryBindingRegistry,
   loads: QuerySelectorLoad[],
   hookId?: string,
-  mayInitialize = false
+  mayInitialize = false,
+  follow?: QueryFollowContext
 ): T {
   if (descriptors.size === 0) return state
   const target = Object.isFrozen(state) ? { ...state } : state
@@ -312,7 +458,8 @@ export function createQuerySelectorState<T extends object>(
     registry,
     loads,
     hookId,
-    mayInitialize
+    mayInitialize,
+    follow
   ) as T
 }
 
@@ -400,6 +547,32 @@ export function prepareQuerySelectorSuspense(
   suspendOn(thenables)
 }
 
+/** The key and argument an owner load acts on: its render key, or the key it resumes. */
+function ownerTarget(load: QuerySelectorLoad): { key: QueryCacheKey; arg: unknown } {
+  return load.resume ?? { key: load.key, arg: load.arg }
+}
+
+/**
+ * Confirm every owner collected by the selector in the layout phase: `activate(key)` moves the
+ * model field to the owner's key and settles followers before paint, whatever the `enabled` /
+ * `dependsOn` gates or the in-flight dedupe decide about the fetch itself. A `suspend(key)` owner
+ * also records here whether its key loads behind the previous result (`placeholderData`), a
+ * decision read against the key that was active before it.
+ */
+export function activateQuerySelectorOwners(loads: QuerySelectorLoad[]): void {
+  const seen = new Set<string>()
+  for (const load of loads) {
+    if (!load.owner) continue
+    const target = ownerTarget(load)
+    const identity = `${load.path}\u0000${target.key}`
+    if (seen.has(identity)) continue
+    seen.add(identity)
+    const activate = Reflect.get(load.controller, RESOURCE_ACTIVATE)
+    if (typeof activate !== 'function') continue
+    activate.call(load.controller, target.arg, target.key, load.mode)
+  }
+}
+
 export function runQuerySelectorLoads(
   loads: QuerySelectorLoad[],
   registry: QueryBindingRegistry
@@ -428,51 +601,68 @@ function runSelectedQueryLoads(
   registry: QueryBindingRegistry,
   commitSuspense: boolean
 ): void {
-  const selected = new Map<string, QuerySelectorLoad>()
+  const selected = new Map<string, { load: QuerySelectorLoad; key: QueryCacheKey; arg: unknown }>()
 
   for (const load of loads) {
-    const identity = `${load.path}\u0000${load.key}`
+    const target = load.owner ? ownerTarget(load) : { key: load.key, arg: load.arg }
+    const identity = `${load.path}\u0000${target.key}`
     const previous = selected.get(identity)
-    if (!previous || load.mode === 'suspend') selected.set(identity, load)
+    if (!previous || load.mode === 'suspend') selected.set(identity, { load, ...target })
   }
 
-  for (const load of selected.values()) {
+  for (let { load, key, arg } of selected.values()) {
+    // A follower only refreshes the key the model field is on; it never moves `activeKey`. Its
+    // render-time key may also be stale (an owner rendered after it), in which case the confirm
+    // re-render collects a fresh load. It fetches with the entry's own argument: the owner that
+    // activated the key recorded it there.
+    if (!load.owner) {
+      const runtime = registry.boundResourceRuntime.get(load.controller)
+      if (runtime) {
+        if (runtime.activeKey !== key) continue
+        const entry = runtime.cacheEntries.get(key)
+        if (!entry) continue
+        arg = entry.arg
+      }
+    }
     let pending = registry.selectorLoads.get(load.controller)
     if (!pending) {
       pending = new Map()
       registry.selectorLoads.set(load.controller, pending)
     }
-    if (pending.has(load.key)) continue
+    if (pending.has(key)) continue
 
     const controllerMethod = commitSuspense
       ? Reflect.get(load.controller, RESOURCE_SUSPEND_COMMIT)
       : load.controller[load.method === 'load' ? 'query' : load.method]
     if (typeof controllerMethod !== 'function') continue
 
+    // A resumed key is always explicit; the seed decision was taken for the render key only.
+    const resumed = load.resume !== undefined
+    const hasArg = load.hasArg || resumed
     let promise: Promise<unknown>
     try {
       const result = commitSuspense
         ? controllerMethod.call(
             load.controller,
-            load.arg,
-            load.hasArg,
-            load.key,
-            load.seeded === true
+            arg,
+            hasArg,
+            key,
+            !resumed && load.seeded === true
           )
-        : load.hasArg
-          ? controllerMethod.call(load.controller, load.arg, undefined)
+        : hasArg || !load.owner
+          ? controllerMethod.call(load.controller, arg, undefined)
           : controllerMethod.call(load.controller)
       promise = Promise.resolve(result)
     } catch (error) {
       promise = Promise.reject(error)
     }
 
-    pending.set(load.key, promise)
+    pending.set(key, promise)
     promise
       .catch(() => {})
       .finally(() => {
-        if (pending?.get(load.key) === promise) {
-          pending.delete(load.key)
+        if (pending?.get(key) === promise) {
+          pending.delete(key)
         }
       })
   }
