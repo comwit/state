@@ -1,4 +1,4 @@
-import { serializeResourceArg } from './accessor'
+import { readResourceSeed, serializeResourceArg } from './accessor'
 import type {
   AnyResourceDescriptor,
   PlaceholderData,
@@ -9,11 +9,13 @@ import type {
   ResourceRuntimeState,
 } from './types'
 import {
+  RESOURCE_LOAD_ONLY,
   RESOURCE_SUSPEND_COMMIT,
   RESOURCE_SUSPEND_PLACEHOLDER,
   RESOURCE_SUSPEND_PREPARE,
   RESOURCE_SUSPEND_RESTORE,
   RESOURCE_SUSPEND_STREAM,
+  type LoadOnlyResource,
 } from './types'
 import type { StreamedSuspendResult } from './stream'
 import { SETTLED, suspendOn } from './suspense'
@@ -28,6 +30,8 @@ export type QuerySelectorLoad = {
   mode: 'load' | 'suspend'
   /** A streamed `.suspend()` result initialized this never-read model during the selector. */
   initialized?: boolean
+  /** The selector painted this key's seed; it upgrades after commit instead of suspending. */
+  seeded?: boolean
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -94,20 +98,41 @@ function placeholderState(
   }) as ResourceDataLike
 }
 
+/**
+ * The key's seed shown before its upgrade starts after commit. Mirrors `placeholderState`:
+ * `isFetching` is already true because the upgrade is certain to follow this commit.
+ */
+function seededState(descriptor: AnyResourceDescriptor, seed: unknown): ResourceDataLike {
+  return Object.freeze({
+    ...descriptor.initialState,
+    data: seed,
+    isPartial: true,
+    isLoading: false,
+    isFetching: true,
+    isSuccess: false,
+    isError: false,
+    error: null,
+  }) as ResourceDataLike
+}
+
 function cachedState(
   state: ResourceDataLike,
+  root: object,
   runtime: ResourceRuntimeState | undefined,
   controller: ResourceDataLike,
   descriptor: AnyResourceDescriptor,
-  key: QueryCacheKey,
   registry: QueryBindingRegistry,
-  arg: unknown,
-  mode: 'load' | 'suspend'
+  load: QuerySelectorLoad
 ): ResourceDataLike {
+  const { key, arg, mode } = load
   const activeEntry = runtime?.activeKey === key ? runtime.cacheEntries.get(key) : undefined
   // A first `.suspend()` result is already the proxy value, but until the selecting tree commits
   // the caller keeps reading its immutable staged snapshot, exactly as before activation.
-  if (activeEntry && !activeEntry.suspendNeedsCommit) return state
+  if (activeEntry && !activeEntry.suspendNeedsCommit) {
+    // The proxy shows this key's seed (upgrading, or its upgrade failed): keep it painted.
+    if (state.isPartial === true) load.seeded = true
+    return state
+  }
 
   const entry = runtime?.cacheEntries.get(key)
   const pending =
@@ -122,9 +147,21 @@ function cachedState(
     }) as ResourceDataLike
   }
 
+  // A render-time `.suspend()` rejection is staged on the entry together with `suspendError`.
+  // Any other never-succeeded entry still holds the proxy snapshot taken when it was created,
+  // which may be another key's state (e.g. a failed seeded upgrade) and must not be shown here.
   const entryState = entry?.state
-  if (entryState?.isError === true) {
+  if (entryState?.isError === true && entry?.suspendError !== undefined) {
     return entryState
+  }
+
+  // The key's own partial value beats another key's placeholder. It is read from the model
+  // snapshot this selector renders from, so the seed cannot write to the store during render;
+  // `read(other)` peeks other models' snapshots the same way, without creating or observing them.
+  const seed = readResourceSeed(descriptor, arg, root, registry)
+  if (seed !== undefined) {
+    load.seeded = true
+    return seededState(descriptor, seed)
   }
 
   if (mode === 'suspend') {
@@ -137,6 +174,7 @@ function cachedState(
 
 function createResourceSelector(
   state: ResourceDataLike,
+  root: object,
   controller: ResourceDataLike,
   descriptor: AnyResourceDescriptor,
   path: string,
@@ -147,6 +185,17 @@ function createResourceSelector(
 ) {
   return new Proxy(state, {
     get(target, prop, receiver) {
+      if (
+        prop === 'suspend' &&
+        (descriptor as Partial<LoadOnlyResource>)[RESOURCE_LOAD_ONLY] === true
+      ) {
+        return () => {
+          throw new Error(
+            `[comwit] .suspend() is not available on "${path}": local resources are read with ` +
+              '.load() (local.query(), local.infinite()) or .restore() (local())'
+          )
+        }
+      }
       const selectorMethod = descriptor.selectorMethod ?? 'load'
       const isSuspend =
         prop === 'suspend' && selectorMethod === 'load' && descriptor.kind !== 'realtime'
@@ -180,7 +229,7 @@ function createResourceSelector(
         }
 
         const runtime = registry.boundResourceRuntime.get(controller)
-        return cachedState(state, runtime, controller, descriptor, key, registry, arg, load.mode)
+        return cachedState(state, root, runtime, controller, descriptor, registry, load)
       }
     },
   })
@@ -188,6 +237,7 @@ function createResourceSelector(
 
 function bindSelectorPath(
   state: object,
+  root: object,
   controller: object,
   descriptors: ResourceDescriptorMap,
   registry: QueryBindingRegistry,
@@ -210,6 +260,7 @@ function bindSelectorPath(
         if (!isRecord(bound)) return next
         return createResourceSelector(
           next,
+          root,
           bound,
           descriptor,
           nextPath,
@@ -225,6 +276,7 @@ function bindSelectorPath(
         if (!isRecord(bound)) return next
         return bindSelectorPath(
           next,
+          root,
           bound,
           descriptors,
           registry,
@@ -251,8 +303,10 @@ export function createQuerySelectorState<T extends object>(
 ): T {
   if (descriptors.size === 0) return state
   const target = Object.isFrozen(state) ? { ...state } : state
+  // Descriptor `seed` functions read the model through this read-only snapshot.
   return bindSelectorPath(
     target,
+    state,
     controller,
     descriptors,
     registry,
@@ -333,7 +387,8 @@ export function prepareQuerySelectorSuspense(
         load.arg,
         load.hasArg,
         load.key,
-        load.controller
+        load.controller,
+        load.seeded === true
       )
       thenables.push(promise instanceof Promise ? promise : SETTLED)
     } catch (error) {
@@ -397,7 +452,13 @@ function runSelectedQueryLoads(
     let promise: Promise<unknown>
     try {
       const result = commitSuspense
-        ? controllerMethod.call(load.controller, load.arg, load.hasArg, load.key)
+        ? controllerMethod.call(
+            load.controller,
+            load.arg,
+            load.hasArg,
+            load.key,
+            load.seeded === true
+          )
         : load.hasArg
           ? controllerMethod.call(load.controller, load.arg, undefined)
           : controllerMethod.call(load.controller)

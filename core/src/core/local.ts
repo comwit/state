@@ -3,6 +3,7 @@ import type { Model } from './model'
 import { query } from './query/descriptor'
 import {
   RESOURCE_LIFECYCLE,
+  RESOURCE_LOAD_ONLY,
   RESOURCE_TYPE_OVERRIDE,
   type ResourceLifecycleFactory,
 } from './query/types'
@@ -10,9 +11,11 @@ import type {
   AnyResourceDescriptor,
   InfiniteResourceBuilderOptions,
   InfiniteResourceDescriptor,
+  LoadOnlyResource,
   QueryBindingRegistry,
   QueryCacheEntry,
   QueryCacheKey,
+  QuerySeedShape,
   ResourceBaseState,
   BoundResourceState,
   ResourceDataLike,
@@ -34,9 +37,14 @@ const DEFAULT_SCOPE = 'default'
 
 export type LocalEntityId = string | number
 export type LocalEntity = object
-export type LocalEntityFragment<TEntity extends LocalEntity> = TEntity extends {
-  id: LocalEntityId
-}
+/**
+ * Non-distributive on purpose: distributing over the `any` default of `TEntity` produced a
+ * `Partial<any>` branch without `id`, which made `LocalCollection<T>` unassignable to
+ * `LocalCollection<any>` and rejected `source` on every explicitly typed `local.query<D, A>()`.
+ */
+export type LocalEntityFragment<TEntity extends LocalEntity> = [TEntity] extends [
+  { id: LocalEntityId },
+]
   ? Pick<TEntity, 'id'> & Partial<Omit<TEntity, 'id'>>
   : Partial<TEntity>
 
@@ -92,15 +100,17 @@ export type LocalCollection<TEntity extends LocalEntity> = Readonly<
 >
 
 type LocalResourceDescriptor =
-  SingleResourceDescriptor<any, any, any> | InfiniteResourceDescriptor<any, any, any>
+  | SingleResourceDescriptor<any, any, any, any>
+  | InfiniteResourceDescriptor<any, any, any>
 
 type ResourceArg<TDescriptor> = TDescriptor extends
-  SingleResourceDescriptor<any, infer TArg, any> | InfiniteResourceDescriptor<any, infer TArg, any>
+  | SingleResourceDescriptor<any, infer TArg, any, any>
+  | InfiniteResourceDescriptor<any, infer TArg, any>
   ? TArg
   : never
 
 type ResourceData<TDescriptor> = TDescriptor extends
-  | SingleResourceDescriptor<infer TData, any, any>
+  | SingleResourceDescriptor<infer TData, any, any, any>
   | InfiniteResourceDescriptor<infer TData, any, any>
   ? TData
   : never
@@ -183,10 +193,28 @@ export type Local<TData, TArg = void> = Omit<
   SingleResourceDescriptor<TData, TArg>,
   'isSlowLoading' | 'slowLoadingMs' | 'initialState'
 > &
-  ResourceTypeOverride<BoundLocalResource<TData, TArg>, SelectableLocalResource<TData, TArg>> & {
+  ResourceTypeOverride<BoundLocalResource<TData, TArg>, SelectableLocalResource<TData, TArg>> &
+  LoadOnlyResource & {
     selectorMethod: 'restore'
     initialState: ResourceBaseState<TData>
   }
+
+/**
+ * A `query()` descriptor with the IndexedDB layer attached. Selectors read it with `.load(arg)`
+ * only: `.suspend()` is not available on local resources (a type error, and a thrown error for
+ * untyped callers), because suspending would bypass the durable restore.
+ */
+export type LocalQuery<TData, TArg = void, TSeed = never> = SingleResourceDescriptor<
+  TData,
+  TArg,
+  false,
+  TSeed
+> &
+  LoadOnlyResource
+
+/** A `query.infinite()` descriptor with the IndexedDB layer attached; `.load(arg)` only. */
+export type LocalInfinite<TData, TArg = void> = InfiniteResourceDescriptor<TData, TArg> &
+  LoadOnlyResource
 
 export type LocalStandaloneOptions<
   TData,
@@ -197,12 +225,18 @@ export type LocalStandaloneOptions<
   initialData: TData
 }
 
+/**
+ * `local.query()` options. Like `query()`, a `seed` needs the seed shape as the third generic:
+ * `local.query<Detail, Arg, Seed>({ seed })`. `TEntity`/`TMeta` follow it.
+ */
 export type LocalQueryOptions<
   TData,
   TArg,
+  TSeed = never,
   TEntity extends LocalEntity = any,
   TMeta = any,
-> = SingleResourceBuilderOptions<TData, TArg> & LocalResourceOptions<TEntity, TArg, TData, TMeta>
+> = SingleResourceBuilderOptions<TData, TArg, TSeed> &
+  LocalResourceOptions<TEntity, TArg, TData, TMeta>
 
 export type LocalInfiniteOptions<
   TData,
@@ -224,16 +258,28 @@ export type LocalFactory = {
       ResourceData<TDescriptor>,
       TMeta
     >
-  ): TDescriptor
+  ): TDescriptor & LoadOnlyResource
   collection<TEntity extends LocalEntity>(
     options: LocalCollectionOptions<TEntity>
   ): LocalCollection<TEntity>
-  query<TData, TArg = void, TEntity extends LocalEntity = any, TMeta = any>(
-    options: LocalQueryOptions<TData, TArg, TEntity, TMeta>
-  ): SingleResourceDescriptor<TData, TArg>
+  /**
+   * A durable `query()`, read with `.load(arg)`. With a `seed` (third generic, same rules as
+   * `query()`) the seed paints synchronously, then the restored IndexedDB view replaces it as the
+   * key's full value, then the network revalidates per `staleTime`. A key already restored in this
+   * provider never shows its seed.
+   */
+  query<
+    TData,
+    TArg = void,
+    TSeed extends QuerySeedShape<TData, TSeed> = never,
+    TEntity extends LocalEntity = any,
+    TMeta = any,
+  >(
+    options: LocalQueryOptions<TData, TArg, TSeed, TEntity, TMeta>
+  ): LocalQuery<TData, TArg, TSeed>
   infinite<TData, TArg = void, TEntity extends LocalEntity = any, TMeta = any>(
     options: LocalInfiniteOptions<TData, TArg, TEntity, TMeta>
-  ): InfiniteResourceDescriptor<TData, TArg>
+  ): LocalInfinite<TData, TArg>
 }
 
 function createCollection<TEntity extends LocalEntity>(
@@ -267,7 +313,7 @@ function attachLocal<
 >(
   descriptor: TDescriptor,
   options: LocalResourceOptions<TEntity, ResourceArg<TDescriptor>, ResourceData<TDescriptor>, TMeta>
-): TDescriptor {
+): TDescriptor & LoadOnlyResource {
   if ((descriptor as { kind: string }).kind === 'realtime') {
     throw new Error('local() supports query() and query.infinite(), not query.realtime()')
   }
@@ -297,12 +343,19 @@ function attachLocal<
     configurable: false,
     writable: false,
   })
+  // Durable resources are read with `.load()`/`.restore()`; the selector rejects `.suspend()`.
+  Object.defineProperty(descriptor, RESOURCE_LOAD_ONLY, {
+    value: true,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  })
 
   if (options.serializeArg) {
     descriptor.serializeArg = options.serializeArg as (arg: ResourceArg<TDescriptor>) => string
   }
 
-  return descriptor
+  return descriptor as TDescriptor & LoadOnlyResource
 }
 
 function splitLocalOptions<
@@ -346,9 +399,15 @@ function createStandaloneLocal<TData, TArg = void, TEntity extends LocalEntity =
   return attached as unknown as Local<TData, TArg>
 }
 
-function createLocalQuery<TData, TArg = void, TEntity extends LocalEntity = any, TMeta = any>(
-  options: LocalQueryOptions<TData, TArg, TEntity, TMeta>
-): SingleResourceDescriptor<TData, TArg> {
+function createLocalQuery<
+  TData,
+  TArg = void,
+  TSeed extends QuerySeedShape<TData, TSeed> = never,
+  TEntity extends LocalEntity = any,
+  TMeta = any,
+>(
+  options: LocalQueryOptions<TData, TArg, TSeed, TEntity, TMeta>
+): LocalQuery<TData, TArg, TSeed> {
   const { resourceOptions, localOptions } = splitLocalOptions<
     TEntity,
     TArg,
@@ -356,15 +415,16 @@ function createLocalQuery<TData, TArg = void, TEntity extends LocalEntity = any,
     TMeta,
     typeof options
   >(options)
+  // `seed` stays in resourceOptions: query() validates it and the shared accessor paints it.
   return attachLocal(
-    query(resourceOptions as SingleResourceBuilderOptions<TData, TArg>),
+    query<TData, TArg, TSeed>(resourceOptions as SingleResourceBuilderOptions<TData, TArg, TSeed>),
     localOptions
   )
 }
 
 function createLocalInfinite<TData, TArg = void, TEntity extends LocalEntity = any, TMeta = any>(
   options: LocalInfiniteOptions<TData, TArg, TEntity, TMeta>
-): InfiniteResourceDescriptor<TData, TArg> {
+): LocalInfinite<TData, TArg> {
   const { resourceOptions, localOptions } = splitLocalOptions<
     TEntity,
     TArg,
@@ -718,6 +778,8 @@ function normalizeState(
   const stateMeta: Record<string, unknown> = { ...plain }
   delete stateMeta.data
   delete stateMeta.isSlowLoading
+  // Library-owned like the flags below: a restored view is always the key's full value.
+  delete stateMeta.isPartial
   delete stateMeta.isLoading
   delete stateMeta.isFetching
   delete stateMeta.isSuccess
@@ -1486,6 +1548,8 @@ export class LocalResourceBinding {
       return
     }
     if (!this.activeView) return
+    // A seed is not the key's value: edits to it stay in memory until the upgrade lands.
+    if ((this.state as { isPartial?: boolean }).isPartial === true) return
     for (const id of idsFromOp(op, this.state, this.metadata)) this.dirtyIds.add(id)
     if (this.pendingMutation) return
     this.pendingMutation = true

@@ -15,22 +15,12 @@ import {
   type SingleResourceDescriptor,
 } from './types'
 
-export function createSingleDescriptor<TData, TArg = void>(
-  opts: SingleResourceBuilderOptions<TData, TArg>
-): SingleResourceDescriptor<TData, TArg> {
+export function createSingleDescriptor<TData, TArg = void, TSeed = never>(
+  opts: SingleResourceBuilderOptions<TData, TArg, TSeed>
+): SingleResourceDescriptor<TData, TArg, false, TSeed> {
   validateSlowLoadingMs(opts.slowLoadingMs)
-  const initialState: ResourceSingleState<TData> = {
-    data: opts.initialData,
-    isLoading: false,
-    isSlowLoading: false,
-    isFetching: false,
-    isSuccess: false,
-    isError: false,
-    error: null,
-  }
-
   const {
-    initialData: _initialData,
+    initialData,
     suspense,
     streamBatchInterval,
     slowLoadingMs,
@@ -38,8 +28,26 @@ export function createSingleDescriptor<TData, TArg = void>(
     enabled,
     dependsOn,
     refetchInterval,
+    seed,
     ...optionValues
-  } = opts as SingleResourceBuilderOptions<TData, TArg>
+  } = opts as SingleResourceBuilderOptions<TData, TArg, unknown>
+  if (seed !== undefined && typeof seed !== 'function') {
+    throw new TypeError(
+      'query() seed must be a function: (arg, { state, read }) => partial | null'
+    )
+  }
+
+  const initialState: ResourceSingleState<TData> = {
+    data: initialData,
+    isLoading: false,
+    isSlowLoading: false,
+    isFetching: false,
+    isSuccess: false,
+    isError: false,
+    error: null,
+    // Only a seeded query tracks whether its visible value is partial.
+    ...(seed ? { isPartial: false } : {}),
+  }
 
   return {
     ...initialState,
@@ -54,6 +62,7 @@ export function createSingleDescriptor<TData, TArg = void>(
     enabled,
     dependsOn,
     refetchInterval,
+    seed: seed as SingleResourceDescriptor<TData, TArg, false, TSeed>['seed'],
   }
 }
 
@@ -130,7 +139,7 @@ export function createRealtimeDescriptor<TData, TArg = void>(
 }
 
 export const query: ResourceFactory = Object.assign(
-  (opts: SingleResourceBuilderOptions<unknown, unknown>) => createSingleDescriptor(opts),
+  (opts: SingleResourceBuilderOptions<unknown, unknown, unknown>) => createSingleDescriptor(opts),
   {
     infinite: createInfiniteDescriptor,
     realtime: createRealtimeDescriptor,

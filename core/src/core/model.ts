@@ -62,6 +62,11 @@ export type StoreEntry<T extends object = any> = {
     field: PropertyKey,
     seed: { ready: boolean; value: unknown }
   ): { ready: boolean; value: unknown }
+  /**
+   * The current snapshot without marking the model as read, so a model another model's `seed`
+   * peeks at can still be initialized by its own first hydration or streamed result.
+   */
+  peekSnapshot(): T
   hasReadSnapshot(): boolean
   subscribe(listener: () => void): () => void
   history?: HistoryController
@@ -270,6 +275,9 @@ export function model<T extends object, D extends object = {}>(
           serverFields.set(field, selected)
           if (selected.ready) serverSnapshot = buildServerSnapshot()
           return selected
+        },
+        peekSnapshot() {
+          return readSnapshot()
         },
         hasReadSnapshot() {
           return snapshotRead

@@ -8,6 +8,8 @@
   },
   "include": [
     "tests/query-hydrate.types.ts",
+    "tests/local.types.ts",
+    "tests/query-seed.types.ts",
     "tests/router.types.ts",
     "tests/slow-loading.types.ts"
   ]

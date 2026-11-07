@@ -1,6 +1,12 @@
 // Types
 export type {
   PlaceholderData,
+  QuerySeed,
+  QuerySeedContext,
+  QuerySeedRead,
+  QuerySeedShape,
+  SeededData,
+  SeededSingleResourceState,
   QueryDefaultOptions,
   QueryQueryOptions,
   QueryHydrationEntries,
@@ -24,6 +30,9 @@ export type {
   BoundResourceState,
   SelectableSingleResourceState,
   SelectableInfiniteResourceState,
+  LoadableSingleResourceState,
+  LoadableInfiniteResourceState,
+  LoadOnlyResource,
   SelectableRealtimeResourceState,
   SelectableResourceState,
   SingleResourceBuilderOptions,
@@ -38,7 +47,12 @@ export type {
 export { query, isResourceDescriptor, keepPreviousData } from './descriptor'
 
 // Accessor
-export { createResourceAccessor, mergeResult, serializeQueryArg } from './accessor'
+export {
+  createResourceAccessor,
+  mergeResult,
+  readResourceSeed,
+  serializeQueryArg,
+} from './accessor'
 
 // React selector auto-load
 export {

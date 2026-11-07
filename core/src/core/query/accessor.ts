@@ -1,4 +1,4 @@
-import { snapshot } from '../proxy'
+import { isProxy, snapshot } from '../proxy'
 import { isEqual } from '../../utils'
 import { DEFAULT_GC_TIME } from './registry'
 import { createSlowLoadingClock } from './slow-loading'
@@ -20,6 +20,8 @@ import {
   type QueryCacheKey,
   type QueryDefaultOptions,
   type QueryMode,
+  type QuerySeed,
+  type QuerySeedRead,
   type RealtimeResourceDescriptor,
   type ResourceBaseState,
   type ResourceContext,
@@ -70,8 +72,8 @@ export function mergeResult(state: ResourceDataLike, result: unknown, appendData
 
   if (isRecord(result)) {
     const hasData = 'data' in result
-    // Query results cannot supply this library-owned derived flag.
-    const { isSlowLoading: _slowLoading, ...patch } = result
+    // Query results cannot supply these library-owned derived flags.
+    const { isSlowLoading: _slowLoading, isPartial: _partial, ...patch } = result
 
     if (
       appendData &&
@@ -101,6 +103,54 @@ export function mergeResult(state: ResourceDataLike, result: unknown, appendData
 
 function contextFor<TState>(state: TState) {
   return { state: snapshot(state as ResourceDataLike) as Readonly<TState> }
+}
+
+/**
+ * Evaluate a single query's declared `seed` for one key against the owning model's state.
+ * Returns `undefined` when the descriptor has no seed or the model holds nothing for the key.
+ * Only `query()` and `local.query()` declare one; infinite, realtime and standalone `local()`
+ * resources never carry a `seed`.
+ *
+ * `read(other)` hands the seed another model's current snapshot through
+ * `registry.peekModelSnapshot`, which the provider binds to its store map: it never creates,
+ * observes or marks that model as read, so a model nothing has registered yet reads as
+ * `undefined` and the key loads normally. The snapshot is the plain frozen state, not a bound
+ * controller or selector, so it exposes no `.load()`/`.query()` and rejects writes.
+ */
+export function readResourceSeed(
+  descriptor: AnyResourceDescriptor,
+  arg: unknown,
+  modelState: object | undefined,
+  registry: QueryBindingRegistry
+): unknown {
+  if (descriptor.kind !== 'single') return undefined
+  const seed = (descriptor as { seed?: QuerySeed<unknown, unknown> }).seed
+  if (typeof seed !== 'function' || modelState === undefined) return undefined
+  const read = ((model: object) => registry.peekModelSnapshot?.(model)) as QuerySeedRead
+  return seed(arg, { state: modelState, read }) ?? undefined
+}
+
+/**
+ * A seed read from the live model proxy may be (or contain) a proxied list item. Writing that
+ * reference into the resource would alias the detail with its list row, so detach it first.
+ */
+function detachProxies(value: unknown): unknown {
+  if (isProxy(value)) return snapshot(value as object)
+  if (Array.isArray(value)) return value.map(detachProxies)
+  if (typeof value === 'object' && value !== null) {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) return value
+    const out: Record<PropertyKey, unknown> = {}
+    for (const key of Reflect.ownKeys(value)) {
+      out[key] = detachProxies(Reflect.get(value, key))
+    }
+    return out
+  }
+  return value
+}
+
+function materializeSeed(seed: unknown): unknown {
+  return structuredClone(detachProxies(seed))
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -371,6 +421,25 @@ export function createResourceAccessor(
 
   const beginLifecycleRequests = () => lifecycleBindings.map((binding) => binding.beginRequest?.())
 
+  /** Only a query declared with `seed` carries `isPartial`; other resources keep their shape. */
+  const tracksPartial = 'isPartial' in descriptor.initialState
+
+  /** The key's seed as a detached, writable value, or `undefined` when the model has none. */
+  const readSeed = (arg: unknown): unknown => {
+    if (!tracksPartial) return undefined
+    const seed = readResourceSeed(descriptor, arg, modelState, registry)
+    return seed === undefined ? undefined : materializeSeed(seed)
+  }
+
+  /** Show a key's seed on the proxy: initial flags, the partial value, `isPartial: true`. */
+  const paintSeed = (seed: unknown) => {
+    runInternal(() => {
+      Object.assign(state, descriptor.initialState)
+      state.data = seed
+      state.isPartial = true
+    })
+  }
+
   const applyRemoteResult = (result: unknown, appendData: boolean, requestTokens: unknown[]) => {
     const shouldReconcile = lifecycleBindings.some((binding) => binding.afterApply)
     const previousState = shouldReconcile
@@ -378,6 +447,8 @@ export function createResourceAccessor(
       : undefined
 
     runInternal(() => mergeResult(state, result, appendData))
+    // Any applied remote value is the key's full value; it replaces a seed for good.
+    if (tracksPartial && result !== undefined) state.isPartial = false
     runtime.slowLoading?.sync()
 
     if (!previousState) return
@@ -473,7 +544,8 @@ export function createResourceAccessor(
     }
 
     const activeEntryBefore = getActiveEntry()
-    if (isRefetch && !activeEntryBefore?.hasQueried) {
+    // A refetch needs an active key with a result; a key still showing its seed upgrades instead.
+    if (isRefetch && !activeEntryBefore?.hasQueried && state.isPartial !== true) {
       return
     }
 
@@ -528,25 +600,35 @@ export function createResourceAccessor(
 
     const currentFetchId = ++runtime.fetchId
 
+    // A key without a full result paints its seed while the upgrade runs, whatever staleTime says.
+    // Read once here: a durable restore below may turn the key into a full value first.
+    let seed = entry.hasQueried ? undefined : readSeed(queryArg)
+
     // Lifecycle adapters may restore an exact durable view before the remote driver runs.
     if (lifecycleBindings.length > 0 && !entry.resourceHydrated && !entry.hasQueried) {
       const isArgChange = !isRefetch && activeEntryBefore?.hasQueried
       const hasPlaceholderData = effectiveOptions.placeholderData !== undefined
 
-      if (isArgChange && !hasPlaceholderData) {
-        runInternal(() => Object.assign(state, descriptor.initialState))
-      }
-      runInternal(() =>
-        applyPlaceholderData(
-          state as ResourceBaseState<unknown>,
-          queryArg as never,
-          effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
+      if (seed !== undefined) {
+        // The seed shows synchronously, before the durable view is even read.
+        paintSeed(seed)
+      } else {
+        // Leaving a seeded key for an unseeded one never carries the seed along.
+        if ((isArgChange && !hasPlaceholderData) || state.isPartial === true) {
+          runInternal(() => Object.assign(state, descriptor.initialState))
+        }
+        runInternal(() =>
+          applyPlaceholderData(
+            state as ResourceBaseState<unknown>,
+            queryArg as never,
+            effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
+          )
         )
-      )
+      }
 
       state.isError = false
       state.error = null
-      state.isLoading = !state.isSuccess
+      state.isLoading = seed === undefined && !state.isSuccess
       state.isFetching = true
       runtime.slowLoading?.sync()
 
@@ -568,6 +650,8 @@ export function createResourceAccessor(
           state.isSuccess = true
           state.isError = false
           state.error = null
+          // A restored durable view is the key's full value: it replaces the seed like a fetch.
+          if (tracksPartial) state.isPartial = false
         })
         entry.hasQueried = true
         entry.lastFetchedAt = hydrated.fetchedAt
@@ -578,6 +662,7 @@ export function createResourceAccessor(
             ? { data: hydrated.data, ...hydrated.state }
             : hydrated.data)
         updateCachedState(entry, state)
+        seed = undefined
       }
     }
 
@@ -602,19 +687,25 @@ export function createResourceAccessor(
     // Determine if args changed (new cache entry, not a refetch)
     const isArgChange = !isRefetch && !entry.hasQueried && activeEntryBefore?.hasQueried
     const hasPlaceholderData = effectiveOptions.placeholderData !== undefined
+    // A seed on the proxy belongs to the key that showed it; never leave it under another key.
+    const leavesSeed = state.isPartial === true
 
-    // When args change and no placeholderData, reset to initial state
-    if (isArgChange && !hasPlaceholderData) {
-      runInternal(() => Object.assign(state, descriptor.initialState))
-    }
+    if (seed !== undefined) {
+      paintSeed(seed)
+    } else {
+      // When args change and no placeholderData, reset to initial state
+      if ((isArgChange && !hasPlaceholderData) || leavesSeed) {
+        runInternal(() => Object.assign(state, descriptor.initialState))
+      }
 
-    runInternal(() =>
-      applyPlaceholderData(
-        state as ResourceBaseState<unknown>,
-        queryArg as never,
-        effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
+      runInternal(() =>
+        applyPlaceholderData(
+          state as ResourceBaseState<unknown>,
+          queryArg as never,
+          effectiveOptions.placeholderData as PlaceholderData<unknown, unknown> | undefined
+        )
       )
-    )
+    }
 
     if (descriptor.kind === 'infinite' && mode !== 'restore') {
       const infiniteHistory = entry.cursorHistory
@@ -637,10 +728,13 @@ export function createResourceAccessor(
 
     state.isError = false
     state.error = null
+    // When a seed is shown, the upgrade is a background fetch (isLoading=false)
     // When args changed without placeholderData, this is a fresh load (isLoading=true)
     // When args changed with placeholderData, previous data is kept (isLoading=false)
     // When refetching same arg, data is kept (isLoading=false)
-    if (isArgChange && !hasPlaceholderData) {
+    if (seed !== undefined) {
+      state.isLoading = false
+    } else if (isArgChange && !hasPlaceholderData) {
       state.isLoading = true
     } else {
       state.isLoading = !state.isSuccess
@@ -878,7 +972,8 @@ export function createResourceAccessor(
     arg: unknown,
     hasArg: boolean,
     key: QueryCacheKey,
-    controller: object
+    controller: object,
+    seeded = false
   ): Promise<unknown> | undefined => {
     const queryArg = hasArg ? arg : undefined
     let entry = runtime.cacheEntries.get(key)
@@ -892,6 +987,9 @@ export function createResourceAccessor(
     if (entry.hasQueried) return
     if (entry.suspendError) throw entry.suspendError
     if (entry.suspendPromise) return entry.suspendPromise
+    // The selector painted this key's seed: it upgrades after commit like `.load()`, never
+    // suspends, and stays painted if that upgrade fails.
+    if (seeded) return
     if (keepsPreviousResult(key)) return
 
     // Reuse an effect/direct query that was already started for this exact
@@ -1090,13 +1188,15 @@ export function createResourceAccessor(
   const commitSuspend = async (
     arg: unknown,
     hasArg: boolean,
-    key: QueryCacheKey
+    key: QueryCacheKey,
+    seeded = false
   ): Promise<unknown> => {
     const queryArg = hasArg ? arg : undefined
     const entry = runtime.cacheEntries.get(key)
     if (!entry?.hasQueried) {
-      // A key kept behind placeholder data loads now, keeping the previous result visible.
-      return readSuspendPlaceholder(key)
+      // A seeded key upgrades now; a key kept behind placeholder data loads now. Both keep the
+      // painted value visible.
+      return seeded || readSuspendPlaceholder(key)
         ? executeQuery(queryArg, undefined, hasArg, 'replace', false)
         : Promise.resolve()
     }
@@ -1152,7 +1252,9 @@ export function createResourceAccessor(
 
   const refetch = () => {
     const active = getActiveEntry()
-    if (!active?.hasQueried) return Promise.resolve()
+    if (!active) return Promise.resolve()
+    // Refetching a key that still shows its seed runs the upgrade (e.g. a retry after an error).
+    if (!active.hasQueried && state.isPartial !== true) return Promise.resolve()
     return executeQuery(active.arg, undefined, true, 'replace', true)
   }
 
@@ -1285,6 +1387,8 @@ export function createResourceAccessor(
     state.isSuccess = true
     state.isError = false
     state.error = null
+    // `.set()` always means the full value.
+    if (tracksPartial) state.isPartial = false
 
     entry.hasQueried = true
     entry.resourceHydrated = true
