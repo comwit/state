@@ -26,6 +26,53 @@ type ResourceResultShape<
 export type PlaceholderData<TData, TArg = void> =
   TData | ((arg: TArg, previousData: TData) => TData)
 
+export type QuerySeedContext = {
+  /**
+   * The owning model's current state, read the way `computed()` reads it. During render this is
+   * the read-only snapshot the selector renders from; never write to it.
+   */
+  state: any
+}
+
+/**
+ * Derives a key's partial value from the owning model, typically a list item that shares the
+ * detail's identity. Return `null` or `undefined` when the model holds nothing for that key.
+ */
+export type QuerySeed<TArg, TSeed> = (
+  arg: TArg,
+  context: QuerySeedContext
+) => TSeed | null | undefined
+
+/** `TSeed` may only name fields of the full value, each with the full value's type. */
+export type QuerySeedShape<TData, TSeed> = Partial<NonNullable<TData>> &
+  Record<Exclude<keyof TSeed, keyof NonNullable<TData>>, never>
+
+/** A seeded read: seed fields are present, detail-only fields are still optional. */
+export type SeededData<TData, TSeed> = TSeed & Partial<Omit<NonNullable<TData>, keyof TSeed>>
+
+/**
+ * Query state discriminated on `isPartial`. While a key shows its seed, `data` is the seed with
+ * detail-only fields optional; a full result (fetched, `.set()`, hydrated or streamed) clears it.
+ */
+export type SeededSingleResourceState<TData, TSeed> =
+  | (ResourceSingleState<TData> & { readonly isPartial: false })
+  | (Omit<ResourceSingleState<TData>, 'data' | 'isLoading' | 'isSuccess' | 'isSlowLoading'> & {
+      readonly isPartial: true
+      data: SeededData<TData, TSeed>
+      isLoading: false
+      isSuccess: false
+      readonly isSlowLoading: false
+    })
+
+/** The seed type a single query descriptor declares, or `never`. */
+type ResourceSeed<T> = T extends { seed?: infer TSeedFn }
+  ? TSeedFn extends (...args: never[]) => infer TResult
+    ? NonNullable<TResult>
+    : never
+  : never
+
+type SeedFlag<TSeed> = [TSeed] extends [never] ? unknown : { readonly isPartial: boolean }
+
 export const RESOURCE_QUERY_OPTION_KEYS = new Set([
   'force',
   'placeholderData',
@@ -88,10 +135,15 @@ export type SubscribeCallbacks<TData> = {
 
 export type ResourceResult<TData> = ResourceResultShape<ResourceBaseState<TData>, TData>
 
-export type Query<TData, TArg = void> = SingleResourceDescriptor<TData, TArg>
+export type Query<TData, TArg = void, TSeed = never> = SingleResourceDescriptor<
+  TData,
+  TArg,
+  false,
+  TSeed
+>
 
 export namespace Query {
-  export type Single<TData, TArg = void> = Query<TData, TArg>
+  export type Single<TData, TArg = void, TSeed = never> = Query<TData, TArg, TSeed>
   export type Infinite<TData, TArg = void> = InfiniteResourceDescriptor<TData, TArg>
   /** @deprecated Use the selector-level `.suspend(arg)` method instead. */
   export type Suspense<TData, TArg = void> = SingleResourceDescriptor<TData, TArg, true>
@@ -143,10 +195,13 @@ export type SingleResourceDescriptor<
   TData,
   TArg = void,
   TSuspense extends boolean = false,
+  TSeed = never,
 > = BaseResourceDescriptor<ResourceSingleState<TData>, TArg, SingleResourceLoadResult<TData>> &
   ResourceSingleState<TData> & {
     kind: 'single'
     __suspense?: TSuspense
+    /** Declared partial value per key; see `SingleResourceBuilderOptions.seed`. */
+    seed?: QuerySeed<TArg, TSeed>
   }
 
 export type InfiniteResourceDescriptor<
@@ -199,8 +254,9 @@ interface ResourceRealtimeQueryController<TData, TArg> extends ResourceSingleQue
   unsubscribe(): void
 }
 
-export type BoundSingleResourceState<TData, TArg = unknown> = ResourceSingleState<TData> &
-  ResourceSingleQueryController<TData, TArg>
+export type BoundSingleResourceState<TData, TArg = unknown, TSeed = never> = ResourceSingleState<TData> &
+  ResourceSingleQueryController<TData, TArg> &
+  SeedFlag<TSeed>
 export type BoundInfiniteResourceState<TData, TArg = unknown> = ResourceInfiniteState<TData> &
   ResourceInfiniteQueryController<TData, TArg>
 export type BoundRealtimeResourceState<TData, TArg = unknown> = ResourceRealtimeState<TData> &
@@ -220,9 +276,15 @@ type ResourceSuspendController<TState, TArg> = [TArg] extends [void]
       suspend(arg: TArg): TState
     }
 
-export type SelectableSingleResourceState<TData, TArg = void> = ResourceSingleState<TData> &
-  ResourceLoadController<ResourceSingleState<TData>, TArg> &
-  ResourceSuspendController<ResourceSingleState<TData>, TArg>
+export type SelectableSingleResourceState<TData, TArg = void, TSeed = never> = [TSeed] extends [
+  never,
+]
+  ? ResourceSingleState<TData> &
+      ResourceLoadController<ResourceSingleState<TData>, TArg> &
+      ResourceSuspendController<ResourceSingleState<TData>, TArg>
+  : SeededSingleResourceState<TData, TSeed> &
+      ResourceLoadController<SeededSingleResourceState<TData, TSeed>, TArg> &
+      ResourceSuspendController<SeededSingleResourceState<TData, TSeed>, TArg>
 export type SelectableInfiniteResourceState<TData, TArg = void> = ResourceInfiniteState<TData> &
   ResourceLoadController<ResourceInfiniteState<TData>, TArg> &
   ResourceSuspendController<ResourceInfiniteState<TData>, TArg>
@@ -279,10 +341,10 @@ export type BoundResourceState<T> = T extends { [RESOURCE_TYPE_OVERRIDE]: { boun
       ? TSuspense extends true
         ? SuspenseInfiniteResourceState<TData, TArg>
         : BoundInfiniteResourceState<TData, TArg>
-      : T extends SingleResourceDescriptor<infer TData, infer TArg, infer TSuspense>
+      : T extends SingleResourceDescriptor<infer TData, infer TArg, infer TSuspense, unknown>
         ? TSuspense extends true
           ? SuspenseSingleResourceState<TData, TArg>
-          : BoundSingleResourceState<TData, TArg>
+          : BoundSingleResourceState<TData, TArg, ResourceSeed<T>>
         : T extends ResourceRealtimeState<infer TData>
           ? BoundRealtimeResourceState<TData, unknown>
           : T extends ResourceInfiniteState<infer TData>
@@ -312,10 +374,10 @@ export type SelectableResourceState<T> = T extends {
       ? TSuspense extends true
         ? SuspenseSelectableInfiniteResourceState<TData, TArg>
         : SelectableInfiniteResourceState<TData, TArg>
-      : T extends SingleResourceDescriptor<infer TData, infer TArg, infer TSuspense>
+      : T extends SingleResourceDescriptor<infer TData, infer TArg, infer TSuspense, unknown>
         ? TSuspense extends true
           ? SuspenseSelectableSingleResourceState<TData, TArg>
-          : SelectableSingleResourceState<TData, TArg>
+          : SelectableSingleResourceState<TData, TArg, ResourceSeed<T>>
         : T extends (infer U)[]
           ? SelectableResourceState<U>[]
           : T extends (...args: any[]) => any
@@ -337,7 +399,7 @@ type QueryHydrationNode<T> =
         ? never
         : T extends InfiniteResourceDescriptor<infer TData, infer TArg, boolean>
           ? QueryHydrationSeed<TData, TArg>
-          : T extends SingleResourceDescriptor<infer TData, infer TArg, boolean>
+          : T extends SingleResourceDescriptor<infer TData, infer TArg, boolean, unknown>
             ? QueryHydrationSeed<TData, TArg>
             : T extends readonly unknown[]
               ? never
@@ -376,7 +438,7 @@ type SlowLoadingOptions = {
   slowLoadingMs?: number
 }
 
-export type SingleResourceBuilderOptions<TData, TArg = void> = SlowLoadingOptions & {
+export type SingleResourceBuilderOptions<TData, TArg = void, TSeed = never> = SlowLoadingOptions & {
   initialData: TData
   /** @deprecated Use the selector-level `.suspend(arg)` method instead. */
   suspense?: boolean
@@ -385,6 +447,14 @@ export type SingleResourceBuilderOptions<TData, TArg = void> = SlowLoadingOption
     arg: TArg,
     context: ResourceContext<ResourceSingleState<TData>>
   ) => AsyncResult<SingleResourceLoadResult<TData>>
+  /**
+   * Paint a key from a partial value the model already holds (a list item) and upgrade it with
+   * `queryFn` after commit. Requires the third generic: `query<Detail, Arg, Seed>({ seed })`.
+   * Runs during render, so it must be pure: read `state`, never write to it. While a key shows
+   * its seed the result reports `isPartial: true`, `.suspend()` does not suspend, and `staleTime`
+   * is ignored. A full result for the key always wins over its seed.
+   */
+  seed?: [TSeed] extends [never] ? never : QuerySeed<TArg, TSeed>
 } & Omit<ResourceQueryOptions<TData, TArg>, 'force'> &
   DependentQueryOptions<TData>
 
@@ -413,9 +483,9 @@ export type ResourceFactory = {
   <TData, TArg = void>(
     opts: SingleResourceBuilderOptions<TData, TArg> & { suspense: true }
   ): SingleResourceDescriptor<TData, TArg, true>
-  <TData, TArg = void>(
-    opts: SingleResourceBuilderOptions<TData, TArg>
-  ): SingleResourceDescriptor<TData, TArg>
+  <TData, TArg = void, TSeed extends QuerySeedShape<TData, TSeed> = never>(
+    opts: SingleResourceBuilderOptions<TData, TArg, TSeed>
+  ): SingleResourceDescriptor<TData, TArg, false, TSeed>
   infinite: {
     <TData, TArg = void>(
       opts: InfiniteResourceBuilderOptions<TData, TArg> & { suspense: true }

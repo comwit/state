@@ -155,6 +155,57 @@ cannot reach the client cache, so client navigation requests it again. There, fe
 and pass the result to `useProduct.hydrate({ detail: { arg: id, data: initialProduct } })` before
 the domain hook reads it. Next.js does not need this. See the [Next.js guide](https://library.comwit.io/state/docs/guide/nextjs).
 
+### Seed a detail from a list item
+
+A detail opened from a list can paint from the list item at once and fill in the rest after
+commit. Declare the seed shape as the third generic of `query()` and derive it from the model
+with `seed`; the same `.suspend(id)` then serves a direct visit (suspends, streams) and an in-app
+navigation (paints the seed, upgrades in the background):
+
+```ts
+const catalog = model({
+  list: query<ProductSummary[]>({ initialData: [], queryFn: api.product.list }),
+  detail: query<ProductDetail | null, string, ProductSummary>({
+    initialData: null,
+    queryFn: (id) => api.product.find(id),
+    seed: (id, { state }) => state.list.data.find((item) => item.id === id),
+  }),
+})
+```
+
+```tsx
+const detail = useCatalog((s) => s.detail.suspend(id))
+if (!detail.data) return <ProductNotFound />
+if (detail.isPartial) return <Product summary={detail.data} /> // detail-only fields are optional
+return <Product summary={detail.data} reviews={detail.data.reviews} />
+```
+
+The result is a union discriminated on `isPartial`. While the key shows its seed, `data` is
+`ProductSummary & Partial<ProductDetail>`, `isPartial` is `true`, `isLoading`/`isSuccess` are
+`false`, and `isFetching` is `true` until the upgrade settles. A full result (`isPartial: false`)
+has `data: ProductDetail | null`. Queries without a seed keep their existing result type.
+
+Rules:
+
+- `seed` runs during render, so it must be pure: read `state` (the model's own state, a read-only
+  snapshot), never write. Return `null`/`undefined` when the model holds nothing for the key.
+- `TSeed` may only name fields of the full value, with the same types; extra keys are a type error.
+- With a seed, `.suspend(id)` does not suspend and `.load(id)` does not report `isLoading`; both
+  paint the seed and start the upgrade after commit. With neither seed nor cache, `.suspend(id)`
+  suspends and streams exactly as before.
+- A full result for the key always wins over its seed and is never downgraded: a fetch, `.set()`,
+  `hydrate()` and a streamed server result are all full results.
+- `staleTime` is ignored while a key is partial: the upgrade always runs.
+- Upgrade rejected: the seed stays, `isError: true`, `isPartial: true` (`refetch()` retries).
+  Upgrade resolved to `null`: `data === null`, `isPartial: false`, so a `!data` branch renders
+  not-found.
+- Seeds are per key. Changing the argument never shows another key's seed, and several mounted
+  readers each paint their own key.
+
+`seed` differs from `placeholderData`: a placeholder keeps *another key's* full result visible
+while a new key loads; a seed is the *same key's* partial value. Infinite, realtime and
+`local.query()` resources do not take a seed.
+
 ### Slow initial loading
 
 Set `slowLoadingMs: 500` on `query()` or `local.query()` and read `isSlowLoading` through the usual
