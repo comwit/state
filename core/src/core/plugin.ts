@@ -61,6 +61,12 @@ export type FieldPlugin = {
     registryState: unknown,
     hasObservers: boolean
   ): void
+
+  /** Called when the provider commits, including a Strict Mode reactivation. */
+  activate?(registryState: unknown): void
+
+  /** Called when the provider unmounts (or Strict Mode deactivates it). */
+  deactivate?(registryState: unknown): void
 }
 
 const plugins: FieldPlugin[] = []
