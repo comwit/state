@@ -145,36 +145,63 @@ function setNestedValue(obj: Record<string, unknown>, path: string, value: unkno
   current[keys[keys.length - 1]] = value
 }
 
+type PersistBinding = {
+  /** Start listening for values written by other tabs. Idempotent. */
+  attach(): void
+  /** Stop listening for values written by other tabs. Idempotent. */
+  detach(): void
+  /** Write a pending local change now instead of after the debounce. */
+  flush(): void
+}
+
 type PersistRegistryState = {
-  cleanups: Map<symbol, Array<() => void>>
+  /**
+   * One entry per bound store (keyed by model). A store reads storage and registers its
+   * writer and cross-tab listener once, however many components bind it through `state()`.
+   */
+  bindings: Map<symbol | object, PersistBinding[]>
+  /** False while the provider is unmounted; cross-tab listeners are detached meanwhile. */
+  active: boolean
 }
 
 function createPersistRegistryState(): PersistRegistryState {
-  return { cleanups: new Map() }
+  return { bindings: new Map(), active: true }
 }
 
 export function bindPersistState(
   proxy: Record<string, unknown>,
   bag: PluginBag,
   registryState: PersistRegistryState,
-  defaults?: PersistDefaults
+  defaults?: PersistDefaults,
+  modelKey?: symbol
 ): void {
+  const bindingKey = modelKey ?? proxy
+  // Hydrating again would replace a local edit whose debounced write is still pending.
+  if (registryState.bindings.has(bindingKey)) return
+
   const debounceMs = defaults?.debounceMs ?? 100
+  const bindings: PersistBinding[] = []
+  // Values that come from storage are not local edits, so no field writes them back.
+  let applyingStored = false
 
   for (const [path, value] of bag) {
     const descriptor = value as PersistDescriptor
     const { key, adapter, defaultValue } = descriptor
-    const cleanups: Array<() => void> = []
 
     // Hydrate from storage
     const stored = adapter.get(key)
-    silent(() => {
-      if (stored !== null) {
-        setNestedValue(proxy, path, stored)
-      } else {
-        setNestedValue(proxy, path, defaultValue)
-      }
-    })
+    applyingStored = true
+    try {
+      silent(() => {
+        if (stored !== null) {
+          setNestedValue(proxy, path, stored)
+        } else {
+          setNestedValue(proxy, path, defaultValue)
+        }
+      })
+    } finally {
+      applyingStored = false
+    }
 
     // Subscribe to proxy changes and write back (debounced)
     const writeBack = debounce(() => {
@@ -182,20 +209,56 @@ export function bindPersistState(
       adapter.set(key, currentValue)
     }, debounceMs)
 
-    const unsub = subscribe(proxy, () => {
-      writeBack()
+    subscribe(proxy, () => {
+      if (!applyingStored) writeBack()
     })
-    cleanups.push(unsub)
-    cleanups.push(() => writeBack.cancel())
 
     // Cross-tab sync
-    if (adapter.subscribe) {
-      const unsubStorage = adapter.subscribe(key, (newValue) => {
-        silent(() => {
-          setNestedValue(proxy, path, newValue)
+    let unsubStorage: (() => void) | null = null
+    const binding: PersistBinding = {
+      attach() {
+        if (unsubStorage || !adapter.subscribe) return
+        unsubStorage = adapter.subscribe(key, (newValue) => {
+          // The other tab wrote last; drop the superseded local write.
+          writeBack.cancel()
+          applyingStored = true
+          try {
+            setNestedValue(proxy, path, newValue)
+          } finally {
+            applyingStored = false
+          }
         })
-      })
-      cleanups.push(unsubStorage)
+      },
+      detach() {
+        unsubStorage?.()
+        unsubStorage = null
+      },
+      flush() {
+        writeBack.flush()
+      },
+    }
+    if (registryState.active) binding.attach()
+    bindings.push(binding)
+  }
+
+  registryState.bindings.set(bindingKey, bindings)
+}
+
+/** Provider committed (again): listen for other tabs. */
+export function activatePersist(registryState: PersistRegistryState): void {
+  registryState.active = true
+  for (const bindings of registryState.bindings.values()) {
+    for (const binding of bindings) binding.attach()
+  }
+}
+
+/** Provider unmounted: write pending changes and stop listening for other tabs. */
+export function deactivatePersist(registryState: PersistRegistryState): void {
+  registryState.active = false
+  for (const bindings of registryState.bindings.values()) {
+    for (const binding of bindings) {
+      binding.flush()
+      binding.detach()
     }
   }
 }
@@ -220,15 +283,25 @@ export const persistPlugin: FieldPlugin = {
     proxy: object,
     bag: PluginBag,
     registryState: unknown,
-    defaults?: Record<string, unknown>
+    defaults?: Record<string, unknown>,
+    modelKey?: symbol
   ): object {
     if (bag.size === 0) return proxy
     bindPersistState(
       proxy as Record<string, unknown>,
       bag,
       registryState as PersistRegistryState,
-      defaults as PersistDefaults | undefined
+      defaults as PersistDefaults | undefined,
+      modelKey
     )
     return proxy
+  },
+
+  activate(registryState: unknown): void {
+    activatePersist(registryState as PersistRegistryState)
+  },
+
+  deactivate(registryState: unknown): void {
+    deactivatePersist(registryState as PersistRegistryState)
   },
 }

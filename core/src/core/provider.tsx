@@ -204,6 +204,7 @@ export function ComwitProvider({
         for (const runtimes of queries?.runtimesByModel.values() ?? []) {
           for (const runtime of runtimes) runtime.slowLoading?.pause()
         }
+        for (const plugin of getPlugins()) plugin.deactivate?.(pluginStates.get(plugin.name))
       },
     }
     const queryRegistry = pluginStates.get('query') as QueryBindingRegistry | undefined
@@ -242,6 +243,7 @@ export function ComwitProvider({
         for (const runtime of runtimes) runtime.slowLoading?.resume()
       }
     }
+    for (const plugin of getPlugins()) plugin.activate?.(registry.pluginStates.get(plugin.name))
     return () => registry.dispose()
   }, [registry])
   const sharedContext = registry.context!
