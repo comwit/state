@@ -12,6 +12,7 @@ import type { Model, StoreEntry } from './model'
 import type { StageMethodDecorator } from '../interceptors/utils'
 import { getDevTools, initDevTools } from './devtools'
 import type { LocalDefaults } from './local'
+import type { PersistDefaults } from './persist'
 import type { QueryBindingRegistry, QueryDefaultOptions } from './query/types'
 import { createSuspendStream, escapeJsonForHtml, SUSPEND_STREAM_ATTRIBUTE } from './query/stream'
 import {
@@ -27,6 +28,7 @@ export type RegistryDefaults = {
   query?: QueryDefaultOptions
   interceptors?: StageMethodDecorator[]
   local?: LocalDefaults
+  persist?: PersistDefaults
   [pluginName: string]: unknown
 }
 

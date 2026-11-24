@@ -2,7 +2,9 @@ import { describe, it, expect, vi } from 'vitest'
 import { model } from '../src/core'
 import { persist, persistPlugin, type PersistAdapter } from '../src/core/persist'
 
-function createMapAdapter<T = unknown>(): PersistAdapter<T> & { store: Map<string, T> } {
+function createMapAdapter<T = unknown>(): PersistAdapter<T> & {
+  store: Map<string, T>
+} {
   const store = new Map<string, T>()
   return {
     store,
@@ -23,7 +25,11 @@ function createPersisted<T>(opts: {
   debounceMs?: number
 }) {
   const m = model({
-    value: persist({ key: opts.key, defaultValue: opts.defaultValue, storage: opts.storage }),
+    value: persist({
+      key: opts.key,
+      defaultValue: opts.defaultValue,
+      storage: opts.storage,
+    }),
   })
   const store = m.instance()
   const bag = m.pluginBags.get('persist')!
@@ -105,6 +111,35 @@ describe('persist', () => {
       expect(setSpy).toHaveBeenCalledTimes(1)
       expect(setSpy).toHaveBeenCalledWith('theme', 'c')
     })
+
+    it('defaults to a 300ms delay', () => {
+      vi.useFakeTimers()
+      try {
+        const setSpy = vi.fn()
+        const m = model({
+          value: persist({
+            key: 'k',
+            defaultValue: 0,
+            storage: { get: () => null, set: setSpy, remove: vi.fn() },
+          }),
+        })
+        const store = m.instance()
+        persistPlugin.bindState(
+          store.proxy,
+          m.pluginBags.get('persist')!,
+          persistPlugin.createRegistryState()
+        )
+        store.proxy.value = 1
+        store.proxy.value = 2
+        vi.advanceTimersByTime(299)
+        expect(setSpy).not.toHaveBeenCalled()
+        vi.advanceTimersByTime(1)
+        expect(setSpy).toHaveBeenCalledTimes(1)
+        expect(setSpy).toHaveBeenCalledWith('k', 2)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
   })
 
   describe('custom adapter', () => {
@@ -154,7 +189,11 @@ describe('persist', () => {
       nameAdapter.store.set('name', 'Alice')
 
       const m = model({
-        name: persist({ key: 'name', defaultValue: 'Guest', storage: nameAdapter }),
+        name: persist({
+          key: 'name',
+          defaultValue: 'Guest',
+          storage: nameAdapter,
+        }),
         age: persist({ key: 'age', defaultValue: 0, storage: ageAdapter }),
       })
       const store = m.instance()

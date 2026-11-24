@@ -28,9 +28,17 @@ function createSpyAdapter<T>(initial?: T) {
   return adapter
 }
 
-function setup(storage: PersistAdapter<number> | 'localStorage') {
+function setup(
+  storage: PersistAdapter<number> | 'localStorage',
+  options?: { debounceMs?: number | false }
+) {
   const prefs = model<{ n: number }>({
-    n: persist({ key: 'n', defaultValue: 0, storage }) as unknown as number,
+    n: persist({
+      key: 'n',
+      defaultValue: 0,
+      storage,
+      ...options,
+    }) as unknown as number,
   })
   // The factory binds the model eagerly, as class-style actions with field initializers do.
   const usePrefs = create(prefs, {
@@ -125,7 +133,7 @@ describe('persist() inside a provider', () => {
     expect(screen.getByRole('button').textContent).toBe('1')
 
     act(() => {
-      vi.advanceTimersByTime(200)
+      vi.advanceTimersByTime(300)
     })
     expect(adapter.store.get('n')).toBe(1)
     expect(screen.getByRole('button').textContent).toBe('1')
@@ -143,7 +151,7 @@ describe('persist() inside a provider', () => {
 
     fireEvent.click(screen.getByRole('button'))
     act(() => {
-      vi.advanceTimersByTime(200)
+      vi.advanceTimersByTime(300)
     })
     expect(screen.getByTestId('reader-0').textContent).toBe('6')
     expect(adapter.store.get('n')).toBe(6)
@@ -171,7 +179,7 @@ describe('persist() inside a provider', () => {
 
     fireEvent.click(screen.getByRole('button'))
     act(() => {
-      vi.advanceTimersByTime(200)
+      vi.advanceTimersByTime(300)
     })
     expect(adapter.set).toHaveBeenCalledTimes(1)
     expect(adapter.set).toHaveBeenLastCalledWith('n', 4)
@@ -241,9 +249,156 @@ describe('persist() inside a provider', () => {
     // An external value is applied, not echoed back as a local edit.
     const setItem = vi.spyOn(window.localStorage, 'setItem')
     act(() => {
-      vi.advanceTimersByTime(200)
+      vi.advanceTimersByTime(300)
     })
     expect(setItem).not.toHaveBeenCalled()
     setItem.mockRestore()
+  })
+})
+
+describe('persist() write timing', () => {
+  function clickTimes(count: number) {
+    for (let i = 0; i < count; i++) fireEvent.click(screen.getByRole('button'))
+  }
+
+  test('memory updates at once; a burst of edits writes storage once after 300ms', () => {
+    const adapter = createSpyAdapter<number>()
+    const { App } = setup(adapter)
+    render(
+      <ComwitProvider>
+        <App />
+      </ComwitProvider>
+    )
+    clickTimes(5)
+    expect(screen.getByRole('button').textContent).toBe('5')
+    act(() => {
+      vi.advanceTimersByTime(299)
+    })
+    expect(adapter.set).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(adapter.set).toHaveBeenCalledTimes(1)
+    expect(adapter.set).toHaveBeenLastCalledWith('n', 5)
+  })
+
+  test.each([
+    ['pagehide', () => window.dispatchEvent(new Event('pagehide'))],
+    ['beforeunload', () => window.dispatchEvent(new Event('beforeunload'))],
+    [
+      'visibilitychange to hidden',
+      () => {
+        Object.defineProperty(document, 'visibilityState', {
+          configurable: true,
+          get: () => 'hidden',
+        })
+        document.dispatchEvent(new Event('visibilitychange'))
+        delete (document as { visibilityState?: unknown }).visibilityState
+      },
+    ],
+  ])('a pending write is flushed on %s', (_name, leave) => {
+    const adapter = createSpyAdapter<number>()
+    const { App } = setup(adapter)
+    render(
+      <ComwitProvider>
+        <App />
+      </ComwitProvider>
+    )
+    clickTimes(3)
+    expect(adapter.set).not.toHaveBeenCalled()
+    leave()
+    expect(adapter.set).toHaveBeenCalledTimes(1)
+    expect(adapter.store.get('n')).toBe(3)
+
+    // Nothing is left pending afterwards.
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    expect(adapter.set).toHaveBeenCalledTimes(1)
+  })
+
+  test('visibilitychange back to visible does not write', () => {
+    const adapter = createSpyAdapter<number>()
+    const { App } = setup(adapter)
+    render(
+      <ComwitProvider>
+        <App />
+      </ComwitProvider>
+    )
+    clickTimes(1)
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(adapter.set).not.toHaveBeenCalled()
+  })
+
+  test('page-leave listeners are removed when the provider unmounts', () => {
+    const add = vi.spyOn(window, 'addEventListener')
+    const remove = vi.spyOn(window, 'removeEventListener')
+    const adapter = createSpyAdapter<number>()
+    const { App } = setup(adapter)
+    const view = render(
+      <StrictMode>
+        <ComwitProvider>
+          <App />
+        </ComwitProvider>
+      </StrictMode>
+    )
+    const net = (type: string) =>
+      add.mock.calls.filter(([t]) => t === type).length -
+      remove.mock.calls.filter(([t]) => t === type).length
+    expect(net('pagehide')).toBe(1)
+    expect(net('beforeunload')).toBe(1)
+    view.unmount()
+    expect(net('pagehide')).toBe(0)
+    expect(net('beforeunload')).toBe(0)
+    add.mockRestore()
+    remove.mockRestore()
+  })
+
+  test.each([0, false] as const)('persist({ debounceMs: %s }) writes on every change', (value) => {
+    const adapter = createSpyAdapter<number>()
+    const { App } = setup(adapter, { debounceMs: value })
+    render(
+      <ComwitProvider>
+        <App />
+      </ComwitProvider>
+    )
+    clickTimes(3)
+    expect(adapter.set).toHaveBeenCalledTimes(3)
+    expect(adapter.set).toHaveBeenLastCalledWith('n', 3)
+  })
+
+  test('provider defaultOptions.persist.debounceMs sets the delay', () => {
+    const adapter = createSpyAdapter<number>()
+    const { App } = setup(adapter)
+    render(
+      <ComwitProvider defaultOptions={{ persist: { debounceMs: 1000 } }}>
+        <App />
+      </ComwitProvider>
+    )
+    clickTimes(2)
+    act(() => {
+      vi.advanceTimersByTime(999)
+    })
+    expect(adapter.set).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(adapter.set).toHaveBeenCalledTimes(1)
+  })
+
+  test('a persist() delay overrides the provider default', () => {
+    const adapter = createSpyAdapter<number>()
+    const { App } = setup(adapter, { debounceMs: 50 })
+    render(
+      <ComwitProvider defaultOptions={{ persist: { debounceMs: false } }}>
+        <App />
+      </ComwitProvider>
+    )
+    clickTimes(2)
+    expect(adapter.set).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(50)
+    })
+    expect(adapter.set).toHaveBeenCalledTimes(1)
   })
 })

@@ -18,6 +18,12 @@ export type PersistOptions<T> = {
   storage?: 'localStorage' | 'sessionStorage' | PersistAdapter<T>
   serialize?: (value: T) => string
   deserialize?: (raw: string) => T
+  /**
+   * Delay before a change is written to storage, in ms. The in-memory value updates
+   * immediately; only the storage write waits. `0` or `false` writes on every change.
+   * Defaults to the provider's `defaultOptions.persist.debounceMs` (300ms).
+   */
+  debounceMs?: number | false
 }
 
 export type PersistDescriptor<T = unknown> = {
@@ -27,11 +33,18 @@ export type PersistDescriptor<T = unknown> = {
   adapter: PersistAdapter<T>
   serialize: (value: T) => string
   deserialize: (raw: string) => T
+  debounceMs?: number | false
 }
 
 export type PersistDefaults = {
-  debounceMs?: number
+  /**
+   * Delay before persisted changes are written to storage, in ms. `0` or `false`
+   * writes on every change. Default 300.
+   */
+  debounceMs?: number | false
 }
+
+export const DEFAULT_PERSIST_DEBOUNCE_MS = 300
 
 function isBrowser(): boolean {
   return (
@@ -111,6 +124,7 @@ export function persist<T>(options: PersistOptions<T>): PersistDescriptor<T> {
     adapter,
     serialize,
     deserialize,
+    ...(options.debounceMs !== undefined ? { debounceMs: options.debounceMs } : {}),
   }
 }
 
@@ -162,10 +176,50 @@ type PersistRegistryState = {
   bindings: Map<symbol | object, PersistBinding[]>
   /** False while the provider is unmounted; cross-tab listeners are detached meanwhile. */
   active: boolean
+  /** Removes the page-leave listeners that flush pending writes; null when not listening. */
+  stopPageLeave: (() => void) | null
 }
 
 function createPersistRegistryState(): PersistRegistryState {
-  return { bindings: new Map(), active: true }
+  return { bindings: new Map(), active: true, stopPageLeave: null }
+}
+
+function flushAll(registryState: PersistRegistryState): void {
+  for (const bindings of registryState.bindings.values()) {
+    for (const binding of bindings) binding.flush()
+  }
+}
+
+/**
+ * Write pending changes when the page may be discarded. `pagehide` and a hidden
+ * `visibilitychange` are the last reliable moments on mobile; `beforeunload` covers
+ * desktop browsers that skip them. Storage writes are synchronous, so they land in time.
+ */
+function listenPageLeave(registryState: PersistRegistryState): void {
+  if (registryState.stopPageLeave || typeof window === 'undefined') return
+  if (typeof window.addEventListener !== 'function') return
+  const flush = () => flushAll(registryState)
+  const onVisibility = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') flush()
+  }
+  window.addEventListener('pagehide', flush)
+  window.addEventListener('beforeunload', flush)
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+  registryState.stopPageLeave = () => {
+    window.removeEventListener('pagehide', flush)
+    window.removeEventListener('beforeunload', flush)
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }
+}
+
+function resolveDebounceMs(
+  descriptor: PersistDescriptor,
+  defaults: PersistDefaults | undefined
+): number {
+  const value = descriptor.debounceMs ?? defaults?.debounceMs ?? DEFAULT_PERSIST_DEBOUNCE_MS
+  return value === false ? 0 : Math.max(0, value)
 }
 
 export function bindPersistState(
@@ -179,7 +233,6 @@ export function bindPersistState(
   // Hydrating again would replace a local edit whose debounced write is still pending.
   if (registryState.bindings.has(bindingKey)) return
 
-  const debounceMs = defaults?.debounceMs ?? 100
   const bindings: PersistBinding[] = []
   // Values that come from storage are not local edits, so no field writes them back.
   let applyingStored = false
@@ -203,11 +256,16 @@ export function bindPersistState(
       applyingStored = false
     }
 
-    // Subscribe to proxy changes and write back (debounced)
-    const writeBack = debounce(() => {
-      const currentValue = getNestedValue(proxy, path)
-      adapter.set(key, currentValue)
-    }, debounceMs)
+    // Subscribe to proxy changes and write back. The proxy already holds the new value;
+    // only the storage write is delayed, so bursts (zoom, scroll, drag) write once.
+    const write = () => {
+      adapter.set(key, getNestedValue(proxy, path))
+    }
+    const debounceMs = resolveDebounceMs(descriptor, defaults)
+    const writeBack: { (): void; cancel(): void; flush(): void } =
+      debounceMs > 0
+        ? debounce(write, debounceMs)
+        : Object.assign(write, { cancel() {}, flush() {} })
 
     subscribe(proxy, () => {
       if (!applyingStored) writeBack()
@@ -242,11 +300,13 @@ export function bindPersistState(
   }
 
   registryState.bindings.set(bindingKey, bindings)
+  if (registryState.active) listenPageLeave(registryState)
 }
 
 /** Provider committed (again): listen for other tabs. */
 export function activatePersist(registryState: PersistRegistryState): void {
   registryState.active = true
+  if (registryState.bindings.size > 0) listenPageLeave(registryState)
   for (const bindings of registryState.bindings.values()) {
     for (const binding of bindings) binding.attach()
   }
@@ -255,6 +315,8 @@ export function activatePersist(registryState: PersistRegistryState): void {
 /** Provider unmounted: write pending changes and stop listening for other tabs. */
 export function deactivatePersist(registryState: PersistRegistryState): void {
   registryState.active = false
+  registryState.stopPageLeave?.()
+  registryState.stopPageLeave = null
   for (const bindings of registryState.bindings.values()) {
     for (const binding of bindings) {
       binding.flush()
